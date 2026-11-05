@@ -91,3 +91,7 @@ is kept.
 - Dependencies are `pillow` and `pyobjc-framework-Cocoa` (which pulls in `pyobjc-core`).
   `uv.lock` pins every wheel with a sha256 hash, and `uv sync --locked` refuses to run
   if the lock is out of date with `pyproject.toml`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Fork the repo, branch from `dev`, and open PRs against `dev`; `dev` is merged into `main` by the maintainer.
