@@ -89,7 +89,7 @@ Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edit
   Spaces still have their file; one left alone longer may point at a deleted image
   until a run happens on it.
 - **Optional: update a Space as you switch to it.** `install.py --watch-spaces` adds a
-  small process that stays running (about 60 MB of memory, no CPU while idle). When you
+  small process that stays running (about 85 MB of memory, no CPU while idle). When you
   switch Spaces, macOS tells it, and it re-applies the last downloaded graph about a
   second after you stop switching, with no network request. Spaces you don't visit still keep their old image.
   Turn it off with `install.py --user YOUR_GITHUB_NAME --no-watch-spaces`; a reinstall

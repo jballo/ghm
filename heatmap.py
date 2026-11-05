@@ -833,7 +833,6 @@ def uninstall() -> int:
 WATCH_DEBOUNCE_SECONDS = 1.0     # let a swipe across several Spaces settle before refreshing
 WATCH_RETRY_SECONDS = 5.0        # lock busy: try again this much later...
 WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wait for the next change
-WATCH_IDLE_WAKE_SECONDS = 3600.0  # longest the idle event loop sleeps before re-checking
 REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
 
 
@@ -920,21 +919,29 @@ def watch_spaces() -> int:
     if load_config() is None:
         log.info("watch: not installed (no config.json); exiting")
         return EXIT_OK
-    from AppKit import (NSApplication, NSApplicationActivationPolicyProhibited, NSWorkspace,
-                        NSWorkspaceActiveSpaceDidChangeNotification)
     import signal
 
+    from AppKit import (NSApplication, NSApplicationActivationPolicyProhibited, NSEvent,
+                        NSEventTypeApplicationDefined, NSWorkspace,
+                        NSWorkspaceActiveSpaceDidChangeNotification)
     from PyObjCTools import AppHelper, MachSignals
 
-    # A connection to the app machinery, with no Dock icon or menu bar, so that NSWorkspace
-    # delivers its notifications to this non-bundled process.
-    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+    # macOS delivers the Space-change notification only to a process running NSApplication's
+    # own event loop (tested on macOS 27.2: a plain NSRunLoop, as PyObjC's runConsoleEventLoop
+    # gives, receives other NSWorkspace notifications but never this one). Prohibited policy:
+    # no Dock icon, no menu bar, never activated.
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
     stopping = False
 
     def stop() -> None:
+        """Make app.run() return (terminate_ would exit() without cleanup)."""
         nonlocal stopping
         stopping = True
-        AppHelper.stopEventLoop()
+        app.stop_(None)
+        # stop_ takes effect after the next event, so post one to wake the loop now.
+        app.postEvent_atStart_(NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            NSEventTypeApplicationDefined, (0, 0), 0, 0, 0, None, 0, 0, 0), True)
 
     # Delivered through a mach port on the run loop, so the handler runs between refreshes
     # (a refresh in progress finishes first) and wakes the idle loop at once.
@@ -947,9 +954,7 @@ def watch_spaces() -> int:
         NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: debouncer.space_changed())
     log.info("watch: watching for Space changes (pid %d)", os.getpid())
     try:
-        # The default maxTimeout (3 s) would wake the idle loop every 3 s; signals, timers and
-        # notifications all wake it themselves, so an hourly cap is only a safety net.
-        AppHelper.runConsoleEventLoop(maxTimeout=WATCH_IDLE_WAKE_SECONDS)
+        app.run()  # sleeps until a notification, timer, signal or event arrives
     finally:
         center.removeObserver_(token)
     if not stopping:

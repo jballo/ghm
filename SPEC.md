@@ -469,9 +469,12 @@ not a guarantee: a busy lock, several displays or system load add to it.)
   ```
 - **How.** `NSApplication.sharedApplication()` with activation policy *prohibited* (no
   Dock icon or menu bar), an observer for `NSWorkspaceActiveSpaceDidChangeNotification`
-  on `NSWorkspace.sharedWorkspace().notificationCenter()`, then
-  `PyObjCTools.AppHelper.runConsoleEventLoop` with `maxTimeout` 3600 s (PyObjC's default
-  of 3 s would wake the idle loop every 3 s). Nothing else is observed.
+  on `NSWorkspace.sharedWorkspace().notificationCenter()`, then `NSApp.run()`. It must be
+  NSApplication's own event loop: tested on macOS 27.2, a plain `NSRunLoop` (as
+  PyObjC's `AppHelper.runConsoleEventLoop` gives) receives other NSWorkspace
+  notifications but never this one. Nothing else is observed. Stopping uses
+  `NSApp.stop_` plus a posted application-defined event so `run()` returns at once
+  (`terminate_` would `exit()` and skip cleanup).
 - **Debounce.** Each notification (re)arms a 1 s timer; only the last one in a burst runs
   a refresh, so swiping across several Spaces does one refresh.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
@@ -486,14 +489,14 @@ not a guarantee: a busy lock, several displays or system load add to it.)
   failed refresh, including a lock error, and keeps running; the next Space change
   tries again.
 - **Exit.** 0 when not installed (no `config.json`, at start or at a refresh) or when
-  stopped by SIGTERM (`launchctl bootout`) or SIGINT. Those signals are routed through
-  PyObjC's `MachSignals` to the run loop, so a refresh in progress finishes first, then
+  stopped by SIGTERM (`launchctl bootout`, `launchctl kickstart -k`) or SIGINT. Those
+  signals are routed through PyObjC's `MachSignals` to the run loop, so a refresh in progress finishes first, then
   the observer is removed and `watch: stopped` is logged. 1 on an unexpected error at
   start, or if the event loop ends without being asked to; launchd then restarts it
   after `ThrottleInterval`. If it is killed outright (SIGKILL), the kernel releases the
   lock and every state write is atomic, so that is safe too.
 - **Cost.** Idle: no measurable CPU; it wakes for a notification, a pending debounce or
-  retry timer, a signal, and at most once an hour otherwise; ~60 MB resident (Python
+  retry timer, or a signal, and has no periodic wakeup; ~85 MB resident (Python
   + AppKit; Pillow is imported only if a refresh has to render a new PNG, and then stays
   loaded).
 - **Interactions.** `--restore` puts the original back only until the next run, now
