@@ -202,6 +202,9 @@ Per display, per run:
    files. Retention makes that rare; it can't rule it out (a Space left alone for more
    than 14 days or 50 renders can still point at a deleted PNG). PNGs are ~32 KB, so
    the cap costs under ~2 MB. mtime is the render time; it is never touched afterwards.
+   So the 14 days count from when a PNG was rendered, not from when a Space last showed
+   it: a PNG reused without re-rendering (step 4) keeps its old mtime and can be pruned
+   as soon as it stops being protected.
 
 Concurrency: `fcntl.flock(LOCK_EX | LOCK_NB)` on `gh-heatmap.lock` (§2; its parent dir is
 created first); if busy, log and exit 2
@@ -273,7 +276,8 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   other Spaces' wallpapers. Another Space (or a display that is not connected) keeps
   its old heatmap until a run finds it current: normally the next successful run
   while you are on that Space, but a GitHub backoff, sleep, a busy lock or a failed
-  run can delay that. Running `heatmap.py` by hand fixes the current Space at once.
+  run can delay that. A successful run by hand updates the current Space at once (the
+  same backoff and lock rules apply, also with `--force`).
   Retention in §6 step 5 keeps the PNGs those Spaces point at for a while.
 
 ## 9. Backup and restore
@@ -403,8 +407,9 @@ restore, so a later run deletes whatever remains.
    (most recent week at the right, Sunday on top).
 2. `uv run heatmap.py --user jballo` → wallpaper changes; `backup.json` exists.
 3. Run again → log says skipped (nothing changed), no new PNG.
-3a. With 2+ desktops: on desktop 1 run `heatmap.py --theme nord`, then `--theme dracula`,
-    then `--theme default`. All three PNGs are still in the support dir (nothing
+3a. With 2+ desktops: on desktop 1 run `heatmap.py --force --theme nord`, then
+    `--force --theme dracula`, then `--force --theme default` (`--force` re-renders, so
+    each PNG's mtime is fresh). All three PNGs are still in the support dir (nothing
     pruned). Swipe to desktop 2 → it still shows its old image until a run happens there;
     `uv run heatmap.py` on desktop 2 updates it.
 4. `install.py --user jballo` → `launchctl print gui/$UID/local.gh-heatmap` shows it loaded;
