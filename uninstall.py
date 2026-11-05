@@ -3,7 +3,8 @@
 
 Usage: python3 uninstall.py
 
-Unloads the LaunchAgent and deletes its plist, then runs `heatmap.py --uninstall`. That
+Unloads the LaunchAgent(s) (the scheduled one and the opt-in Space watcher) and deletes
+their plists, then runs `heatmap.py --uninstall`. That
 mode holds the tool's lock throughout: it restores the original wallpaper (best-effort),
 checks every screen, and deletes the files under ~/Library only if no screen still shows
 one of our PNGs. This script never deletes those files itself. Re-running it is safe and
@@ -33,6 +34,8 @@ LOGS_DIR = Path.home() / "Library" / "Logs"
 LOG_FILES = [LOGS_DIR / "gh-heatmap.log"] + [LOGS_DIR / f"gh-heatmap.log.{i}" for i in (1, 2, 3)]
 LOG_FILES.append(LOGS_DIR / "gh-heatmap.launchd.log")
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+WATCH_LABEL = "local.gh-heatmap.spaces"   # opt-in Space watcher (SPEC §13)
+WATCH_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{WATCH_LABEL}.plist"
 LAUNCHCTL = "/bin/launchctl"
 
 LOCK_BUSY = 3        # heatmap.py --uninstall exit code when another run holds the lock
@@ -75,11 +78,25 @@ def run_heatmap_uninstall() -> int:
 
 def main() -> int:
     """Unschedule, then hand restore + verify + delete to heatmap.py; propagate its result."""
-    # 1-2. Stop the scheduled job (ignore failure: it may not be loaded) and remove its plist,
-    #      whatever happens next, so nothing is scheduled again.
-    subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LABEL}"], check=False, capture_output=True)
-    PLIST_PATH.unlink(missing_ok=True)
-    print(f"==> unloaded {LABEL} (if it was loaded) and deleted {PLIST_PATH}")
+    # 1-2. Stop the scheduled job and the Space watcher and remove their plists, so nothing
+    #      runs again. bootout fails harmlessly for a job that isn't loaded, so `launchctl
+    #      print` checks that each is really gone; one still loaded could put the heatmap
+    #      back after the restore (the watcher on the next Space switch), so stop there.
+    domain = f"gui/{os.getuid()}"
+    still_loaded = []
+    for label, plist in ((LABEL, PLIST_PATH), (WATCH_LABEL, WATCH_PLIST_PATH)):
+        subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{label}"], check=False, capture_output=True)
+        if subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], check=False,
+                          capture_output=True).returncode == 0:
+            still_loaded.append(label)
+            continue  # keep its plist: the job is still there
+        plist.unlink(missing_ok=True)
+        print(f"==> unloaded {label} (if it was loaded) and deleted {plist}")
+    if still_loaded:
+        for label in still_loaded:
+            print(f"Could not stop {label}; it is still loaded. Try `launchctl bootout {domain}/{label}`.")
+        print("Nothing was restored or deleted. Run uninstall.py again once it is stopped.")
+        return 1
 
     # 3. Without the venv we can neither restore nor check the screens: delete nothing.
     if not VENV_PYTHON.exists():
