@@ -515,3 +515,11 @@ lock, several displays or system load can add delay.
   wallpaper does not change the active Space, so a refresh can't trigger itself.
 - **Limits.** It updates the Space you switch *to*. Spaces you don't visit, and displays
   that aren't connected, still keep their old image (§6 step 5 retention still applies).
+- **Tried and rejected: one stable file for every Space.** If every Space pointed at the
+  same path and we replaced that file's contents, Spaces might be current before you
+  arrive. Tested on macOS 27.2 (4 desktops, all pointed at one file, then the file
+  atomically replaced with a different image via temp + fsync + `os.replace`, no set
+  call): neither the current desktop nor any other desktop changed, during or after the
+  swipe. macOS keeps showing the image it already loaded. So with public API the
+  arrival flash can't be avoided, and content-addressed file names stay. (In-place
+  rewriting was not tried: a reader could see a half-written PNG, so it couldn't ship.)
