@@ -1,7 +1,8 @@
 # gh-heatmap
 
-Your public GitHub contribution graph as your macOS desktop wallpaper: black
-background, green squares, refreshed every 10 minutes by a per-user launchd job.
+Your public GitHub contribution graph as your macOS desktop wallpaper: green squares on
+black by default, or one of five built-in themes, refreshed every 10 minutes by a per-user
+launchd job.
 No GitHub token; it reads only `https://github.com/users/<username>/contributions`.
 Design contract: [SPEC.md](SPEC.md).
 
@@ -12,7 +13,7 @@ Design contract: [SPEC.md](SPEC.md).
 Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
 
 ```sh
-python3 install.py --user YOUR_GITHUB_NAME     # optional: --interval 600
+python3 install.py --user YOUR_GITHUB_NAME     # optional: --theme nord, --interval 600
 python3 uninstall.py
 ```
 
@@ -34,10 +35,28 @@ uv run heatmap.py --dry-run --user YOUR_GITHUB_NAME
 open ~/Library/Application\ Support/gh-heatmap/preview.png
 ```
 
-Other flags: `--force` (skip the ETag and up-to-date checks and re-render on every display;
+## Themes
+
+`dracula`, `gruvbox`, `nord`, `panda` and `tokyo-night`, each built from that palette's
+official colours. With no theme set you get the GitHub green look. Pick one when
+installing (`install.py --theme nord`) or change it any time:
+
+```sh
+uv run heatmap.py --list-themes
+uv run heatmap.py --dry-run --theme dracula     # preview only; saves nothing
+uv run heatmap.py --theme dracula               # save it and apply it now
+uv run heatmap.py --theme default               # back to green
+```
+
+Names are case-insensitive. The choice is saved in `config.json`, so the scheduled runs
+keep it, and a reinstall keeps it unless you pass a different `--theme`.
+
+## Other flags
+
+`--force` (skip the ETag and up-to-date checks and re-render on every display;
 it still respects a GitHub backoff and still falls back to cached data when offline) and
 `--restore` (put the saved wallpaper back; deletes nothing). Exit codes: 0 means OK,
-1 means error, 2 means skipped (no screens, backoff, or another run in progress), and 3
+1 means error (including an unknown theme or a bad flag), 2 means skipped (no screens, backoff, or another run in progress), and 3
 means `--restore`/`--uninstall` found the lock busy.
 
 ## Files it creates
@@ -77,7 +96,7 @@ python3 install.py --user YOUR_GITHUB_NAME
 ```
 
 A reinstall never overwrites an existing `backup.json`, so your real original wallpaper
-is kept.
+is kept. It also keeps your saved theme unless you pass `--theme`.
 
 ## Auditing
 

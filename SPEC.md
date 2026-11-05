@@ -1,10 +1,11 @@
 # gh-heatmap — design spec (v1)
 
-Your GitHub contribution graph as your macOS desktop wallpaper: black background,
-green squares, refreshed every 10 minutes by a per-user launchd job. Written in
+Your GitHub contribution graph as your macOS desktop wallpaper: green squares on black
+by default, or one of five built-in themes (§7), refreshed every 10 minutes by a per-user
+launchd job. Written in
 Python so the owner can audit every line.
 
-Non-goals for v1: multiple Spaces, headline text, themes, Linux, a resident daemon.
+Non-goals for v1: multiple Spaces, headline text, custom (user-defined) themes, Linux, a resident daemon.
 
 ## 1. Principles
 
@@ -39,7 +40,8 @@ Runtime files (all created by `heatmap.py`):
 
 ```
 ~/Library/Application Support/gh-heatmap/
-  config.json          {"username": "..."}            written by install.py
+  config.json          {"username": "...", "theme": "nord"}   written by install.py and by
+                       `heatmap.py --theme`; "theme" is absent for the default look
   state.json           see §6
   backup.json          original wallpaper per display, captured once, before first change
   heatmap-<hash>.png   rendered wallpapers (current + previous kept, rest pruned)
@@ -58,8 +60,15 @@ Runtime files (all created by `heatmap.py`):
 
 ```
 heatmap.py                 scheduled run (what launchd calls)
-heatmap.py --user NAME     override config.json username (also used by install.py before config exists)
-heatmap.py --dry-run       fetch + render to ~/Library/Application Support/gh-heatmap/preview.png; do NOT set wallpaper
+heatmap.py --user NAME     override config.json username for this run only (never saved)
+heatmap.py --theme NAME    change the theme: save it in config.json (under the lock), then run as
+                           usual, so it applies now. Case-insensitive; `default` removes the saved
+                           theme. Needs an installed config.json (exit 1 otherwise; it never
+                           creates one). Not allowed with --restore / --uninstall.
+heatmap.py --list-themes   print the five theme names, one per line, and exit 0. Handled before
+                           logging starts: reads and writes no files, takes no lock
+heatmap.py --dry-run       fetch + render to ~/Library/Application Support/gh-heatmap/preview.png; do NOT set wallpaper.
+                           With --theme NAME, previews that theme and saves nothing
 heatmap.py --force         ignore ETag and up-to-date checks; re-render and re-apply on every
                            display; still honours a recorded GitHub backoff and falls back to
                            cached data if the network fails
@@ -72,12 +81,22 @@ Exit codes:
 
 | code | meaning |
 |------|---------|
-| 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything |
-| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify) |
+| 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything; `--list-themes` |
+| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme (given or saved); `--theme` with no config.json; any usage error (argparse is made to exit 1, because 2 means "skipped") |
 | 2 | skipped gracefully (scheduled run): no screens, inside a GitHub backoff window, or the lock is busy |
 | 3 | `--restore` / `--uninstall` only: the lock is busy (uninstall.py waits and retries) |
 
 install.py relies on these codes to verify the first run (§10).
+
+`--theme NAME` on a real run: the username and theme are validated first (any failure is
+exit 1 with nothing written), then the theme is saved, then the run proceeds as usual and
+its exit code is returned unchanged. A saved theme never turns 1 or 2 into 0: if the run
+is skipped (2) or a screen fails (1), the next successful run applies the saved theme.
+
+Config and theme are read once per run, after `--restore` / `--uninstall` have been
+dispatched (those never read config.json, so a bad theme cannot block recovery) and
+before the backoff check, fetch or any `state.json` write. An unknown saved theme is
+exit 1, never a silent fall back to the default.
 Logging: `logging` to the rotating file; also to stderr when stderr is a TTY.
 
 ## 4. Fetch
@@ -148,8 +167,10 @@ Cells not present (edge padding) are simply not drawn.
 ```
 
 `render_hash = sha256(json.dumps({"cells": cells, "w": W, "h": H,
-"style": STYLE_VERSION}, sort_keys=True))[:16]`. `STYLE_VERSION` is a module
-constant; bump it whenever rendering output changes so every display re-renders.
+"style": STYLE_VERSION, "theme": THEME}, sort_keys=True))[:16]`, where `THEME` is the
+resolved colours (`{"background", "levels"}`), not the name, so changing theme or
+editing a palette re-renders every display. `STYLE_VERSION` is a module constant; bump
+it whenever rendering output changes in a way the inputs above don't capture.
 
 Per display, per run:
 
@@ -173,17 +194,35 @@ Per display, per run:
 Concurrency: `fcntl.flock(LOCK_EX | LOCK_NB)` on `gh-heatmap.lock` (§2; its parent dir is
 created first); if busy, log and exit 2
 (`--restore`: exit 3). `--dry-run` takes no lock: it writes only `preview.png` and the
-log, and never writes `state.json`.
+log, and never writes `state.json` or `config.json`. `--list-themes` takes no lock and
+touches no files. `heatmap.py --theme` and `install.py` read and rewrite `config.json` only
+while holding this lock, so neither can lose the other's update.
 
 ## 7. Render (Pillow, imported lazily only when a render is needed)
 
 - Backing size per screen: `r = screen.convertRectToBacking_(screen.frame())`,
   `W, H = int(r.size.width), int(r.size.height)`.
-- Background `#000000`.
 - Grid occupies ~62 % of W: `pitch = 0.62 * W / ncols`; square `size = 0.76 * pitch`;
   `radius = 0.22 * size`; grid is centred horizontally and vertically.
-- Colours (GitHub dark greens on black):
-  level 0 `#1b2a1f`, 1 `#0e4429`, 2 `#006d32`, 3 `#26a641`, 4 `#39d353`.
+- Colours come from the theme: a background plus levels 0–4 (`DEFAULT_THEME` /
+  `THEMES` in heatmap.py; every one passes `validate_theme`: exactly the keys
+  `background` and `levels`, 5 levels, all lowercase `#rrggbb`).
+
+  | theme | background | 0 | 1 | 2 | 3 | 4 |
+  |-------|------------|---|---|---|---|---|
+  | (default, GitHub dark) | `#000000` | `#1b2a1f` | `#0e4429` | `#006d32` | `#26a641` | `#39d353` |
+  | `dracula` | `#282a36` | `#44475a` | `#5c4f7a` | `#7a64a1` | `#9c7cce` | `#bd93f9` |
+  | `gruvbox` | `#282828` | `#3c3836` | `#734723` | `#9e5820` | `#cf6d1c` | `#fe8019` |
+  | `nord` | `#2e3440` | `#3b4252` | `#4e6572` | `#60818f` | `#74a1b0` | `#88c0d0` |
+  | `panda` | `#292a2b` | `#373b41` | `#74445b` | `#9f5377` | `#d06497` | `#ff75b5` |
+  | `tokyo-night` | `#1a1b26` | `#292e42` | `#3c4a6f` | `#4f6599` | `#6584c9` | `#7aa2f7` |
+
+  For the built-ins, the background, level 0 and level 4 are the palette's official
+  colours (Dracula: Background / Current Line / Purple; Gruvbox dark: bg0 / bg1 / bright
+  orange; Nord: nord0 / nord1 / nord8; Panda: background-light / gray / pink; Tokyo
+  Night: bg / bg_highlight / blue). Levels 1–3 are level 4 blended into the background
+  at 35 / 55 / 78 %. Level 0 is always distinct from the background so the empty grid
+  still reads as a grid.
 - `ImageDraw.rounded_rectangle` per cell. Save PNG with `optimize=True` to a temp
   file, then `os.replace` to `heatmap-<render_hash>.png`.
 
@@ -258,14 +297,22 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
 ## 10. `install.py`
 
 ```
-install.py --user NAME [--interval 600]
+install.py --user NAME [--theme NAME] [--interval 600]
 ```
 
-1. Validate username (same regex). Require `uv` on PATH (`shutil.which`).
+1. Validate username (same regex) and `--theme` (case-insensitive; one of
+   `THEME_NAMES`, which must match `heatmap.py --list-themes`, or `default`). Both are
+   checked before anything else, so a bad name changes nothing. Require `uv` on PATH
+   (`shutil.which`).
 2. `uv sync --locked` in the project dir (uses `uv.lock` exactly; fails if the lock
    is missing or out of date with `pyproject.toml` — that is the hash-pinning guarantee.
    `--frozen` would not detect a stale lock).
-3. Create the support dir; write `config.json` atomically.
+3. Create the support dir. Take the lock (§6; retry every 2 s, about 30 s, then exit 1),
+   write `config.json` atomically, release the lock (the first run takes it itself).
+   Theme: `--theme NAME` if given (`default` = none). Otherwise a reinstall keeps the
+   theme saved in the existing config.json, lowercased; if that file is unreadable, not
+   a JSON object, or its theme is not a known name, it prints a warning and uses the
+   default instead of failing.
 4. First run by hand: `.venv/bin/python heatmap.py`. It must exit 0, and afterwards
    `backup.json` must exist or `state.json["backup_not_needed"]` must be `true` (every
    screen's wallpaper was already ours). Otherwise abort before writing the plist
@@ -341,4 +388,9 @@ restore, so a later run deletes whatever remains.
 3. Run again → log says skipped (nothing changed), no new PNG.
 4. `install.py --user jballo` → `launchctl print gui/$UID/local.gh-heatmap` shows it loaded;
    wait ≤10 min, log shows a run from launchd.
+4a. `install.py --user jballo --theme dracula` → Dracula on every display, config.json has
+    `"theme": "dracula"`. `heatmap.py --theme nord` → Nord on every display now;
+    `heatmap.py --theme default` → green, `"theme"` gone. Reinstall without `--theme` keeps
+    the saved theme. `install.py --theme bogus` and `heatmap.py --theme bogus` exit 1 and
+    change nothing.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.

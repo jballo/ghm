@@ -14,7 +14,8 @@ Exit codes (SPEC §3):
   0  success: applied or already up to date on every screen; --restore restored everything;
      --uninstall deleted everything
   1  error, including: --dry-run wrote no preview; --restore could not restore every screen;
-     --uninstall kept the files because a screen still shows our image
+     --uninstall kept the files because a screen still shows our image; an unknown theme;
+     any command-line usage error
   2  skipped gracefully: no screens, inside a GitHub backoff window, or the lock is busy
   3  --restore / --uninstall only: the lock is busy (uninstall.py waits and retries)
 """
@@ -70,8 +71,25 @@ LOG_FILES = [LOG_FILE] + [LOG_FILE.with_name(f"gh-heatmap.log.{i}") for i in (1,
 LOG_FILES.append(LOG_FILE.with_name("gh-heatmap.launchd.log"))
 WALLPAPER_SETTINGS_URL = "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension"
 
-BACKGROUND = "#000000"
-LEVEL_COLOURS = {0: "#1b2a1f", 1: "#0e4429", 2: "#006d32", 3: "#26a641", 4: "#39d353"}
+# Themes (SPEC §7): a background plus the colours of contribution levels 0-4. For the built-ins,
+# the background, level 0 and level 4 are each palette's official published colours; levels
+# 1-3 are level 4 blended into the background at 35 / 55 / 78 % (precomputed here).
+DEFAULT_THEME = {"background": "#000000",  # GitHub greens on black; used when no theme is set
+                 "levels": ["#1b2a1f", "#0e4429", "#006d32", "#26a641", "#39d353"]}
+THEMES = {
+    # Background / Current Line / Purple
+    "dracula": {"background": "#282a36", "levels": ["#44475a", "#5c4f7a", "#7a64a1", "#9c7cce", "#bd93f9"]},
+    # bg0 / bg1 / bright orange (dark)
+    "gruvbox": {"background": "#282828", "levels": ["#3c3836", "#734723", "#9e5820", "#cf6d1c", "#fe8019"]},
+    # nord0 / nord1 / nord8
+    "nord": {"background": "#2e3440", "levels": ["#3b4252", "#4e6572", "#60818f", "#74a1b0", "#88c0d0"]},
+    # background-light / gray / pink (panda-syntax-vscode themes/colors.yaml)
+    "panda": {"background": "#292a2b", "levels": ["#373b41", "#74445b", "#9f5377", "#d06497", "#ff75b5"]},
+    # bg / bg_highlight / blue (night)
+    "tokyo-night": {"background": "#1a1b26", "levels": ["#292e42", "#3c4a6f", "#4f6599", "#6584c9", "#7aa2f7"]},
+}
+RESET_THEME = "default"                   # `--theme default` clears the saved theme
+HEX_COLOUR_RE = re.compile(r"^#[0-9a-f]{6}$")
 FALLBACK_SIZE = (2880, 1800)              # dry-run size when no screen is available
 
 # macOS applies a wallpaper change asynchronously: desktopImageURLForScreen_ can keep
@@ -143,6 +161,38 @@ def validate_username(name: Any) -> str:
     if not isinstance(name, str) or not USERNAME_RE.fullmatch(name):
         raise ValueError(f"invalid GitHub username {name!r}")
     return name
+
+
+def validate_theme(theme: Any) -> dict[str, Any]:
+    """Return theme if it is {"background": "#rrggbb", "levels": [5 x "#rrggbb"]}, else raise ValueError."""
+    if not isinstance(theme, dict) or set(theme) != {"background", "levels"}:
+        raise ValueError("a theme needs exactly the keys 'background' and 'levels'")
+    levels = theme["levels"]
+    if not isinstance(levels, list) or len(levels) != 5:
+        raise ValueError("a theme's 'levels' must be a list of 5 colours")
+    for colour in [theme["background"], *levels]:
+        if not isinstance(colour, str) or not HEX_COLOUR_RE.fullmatch(colour):
+            raise ValueError(f"invalid theme colour {colour!r}; expected lowercase #rrggbb")
+    return theme
+
+
+def normalize_theme_name(name: Any) -> str | None:
+    """Lowercase and check a theme name; None means the default look (no theme, or 'default')."""
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ValueError(f"theme must be a string, not {name!r}")
+    key = name.lower()
+    if key == RESET_THEME:
+        return None
+    if key not in THEMES:
+        raise ValueError(f"unknown theme {name!r}; valid: {', '.join(sorted(THEMES))} (or {RESET_THEME!r})")
+    return key
+
+
+def resolve_theme(name: str | None) -> dict[str, Any]:
+    """The validated colours for a normalized theme name (None = the default look)."""
+    return validate_theme(DEFAULT_THEME if name is None else THEMES[name])
 
 
 # --- Parse and layout (SPEC §5) --------------------------------------------
@@ -224,14 +274,15 @@ def layout(cells: dict[str, int]) -> tuple[dict[str, tuple[int, int]], int]:
 
 # --- Render (SPEC §7) ------------------------------------------------------
 
-def render_hash(cells: dict[str, int], width: int, height: int) -> str:
-    """Hash of everything that affects the rendered PNG (SPEC §6)."""
-    payload = json.dumps({"cells": cells, "w": width, "h": height, "style": STYLE_VERSION}, sort_keys=True)
+def render_hash(cells: dict[str, int], width: int, height: int, theme: dict[str, Any]) -> str:
+    """Hash of everything that affects the rendered PNG (SPEC §6), including the theme's colours."""
+    payload = json.dumps({"cells": cells, "w": width, "h": height, "style": STYLE_VERSION, "theme": theme},
+                         sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def render_png(cells: dict[str, int], width: int, height: int) -> bytes:
-    """Draw the heatmap centred on black and return the PNG bytes."""
+def render_png(cells: dict[str, int], width: int, height: int, theme: dict[str, Any]) -> bytes:
+    """Draw the heatmap centred on the theme's background and return the PNG bytes."""
     from PIL import Image, ImageDraw  # lazy: only runs when a render is needed
 
     positions, ncols = layout(cells)
@@ -244,14 +295,14 @@ def render_png(cells: dict[str, int], width: int, height: int) -> bytes:
     left = (width - grid_w) / 2
     top = (height - grid_h) / 2
 
-    image = Image.new("RGB", (width, height), BACKGROUND)
+    image = Image.new("RGB", (width, height), theme["background"])
     draw = ImageDraw.Draw(image)
     for text, (col, row) in positions.items():
         x0 = round(left + col * pitch)
         y0 = round(top + row * pitch)
         # Pillow boxes include the end pixel, hence the -1.
         box = (x0, y0, x0 + side - 1, y0 + side - 1)
-        draw.rounded_rectangle(box, radius=radius, fill=LEVEL_COLOURS[cells[text]])
+        draw.rounded_rectangle(box, radius=radius, fill=theme["levels"][cells[text]])
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
@@ -565,11 +616,11 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
 
 
 def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: dict[str, Any],
-                    force: bool) -> None:
+                    force: bool, theme: dict[str, Any]) -> None:
     """Render (if needed) and set one screen's wallpaper, then record it; raise on failure."""
     key = str(display_id(screen))
     width, height = backing_size(screen)
-    digest = render_hash(cells, width, height)
+    digest = render_hash(cells, width, height, theme)
     png = SUPPORT_DIR / f"heatmap-{digest}.png"
     current = wallpaper_path(workspace, screen)
     up_to_date = (state["applied"].get(key) == digest and png.exists() and current is not None
@@ -578,7 +629,7 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
         log.info("display %s: up to date; skipped", key)
         return
     if force or not png.exists():
-        atomic_write_bytes(png, render_png(cells, width, height))
+        atomic_write_bytes(png, render_png(cells, width, height, theme))
     set_wallpaper(workspace, screen, str(png), {})
     # Recorded only after the set succeeded. The hash being replaced becomes "previous".
     old = state["applied"].get(key)
@@ -596,7 +647,7 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
         log.warning("display %s: could not read the wallpaper back after setting it (%s)", key, exc)
 
 
-def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool) -> int:
+def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any]) -> int:
     """Update every screen that needs it; return EXIT_OK, EXIT_ERROR or EXIT_SKIPPED."""
     screens, workspace = screens_and_workspace()
     if not screens:
@@ -615,7 +666,7 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool) 
     failed = False
     for index, screen in enumerate(screens):
         try:
-            apply_to_screen(workspace, screen, cells, state, force)
+            apply_to_screen(workspace, screen, cells, state, force, theme)
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True
@@ -751,14 +802,38 @@ def uninstall() -> int:
 
 # --- Entry points (SPEC §3) ------------------------------------------------
 
-def resolve_username(cli_user: str | None) -> str:
+def load_config() -> dict[str, Any] | None:
+    """config.json as a dict, or None if it does not exist; ValueError if it is not a JSON object."""
+    config = read_json(CONFIG_FILE)
+    if config is not None and not isinstance(config, dict):
+        raise ValueError(f"{CONFIG_FILE} is not a JSON object")
+    return config
+
+
+def resolve_username(cli_user: str | None, config: dict[str, Any] | None) -> str:
     """Username from --user, else from config.json; always validated."""
     if cli_user is not None:
         return validate_username(cli_user)
-    config = read_json(CONFIG_FILE)
-    if not isinstance(config, dict) or "username" not in config:
+    if config is None or "username" not in config:
         raise ValueError("no username: pass --user NAME or run install.py")
     return validate_username(config["username"])
+
+
+def saved_theme_name(config: dict[str, Any] | None) -> str | None:
+    """The normalized theme saved in config.json (None = default); ValueError if it is unknown."""
+    return normalize_theme_name(config.get("theme")) if config is not None else None
+
+
+def save_theme(config: dict[str, Any] | None, name: str | None) -> None:
+    """Persist `--theme` in config.json, keeping every other key. Call only under the lock."""
+    if config is None or "username" not in config:
+        raise ValueError("not installed: run install.py --user NAME --theme THEME instead")
+    validate_username(config["username"])
+    updated = {key: value for key, value in config.items() if key != "theme"}
+    if name is not None:
+        updated["theme"] = name
+    atomic_write_json(CONFIG_FILE, updated)
+    log.info("theme set to %s", name or RESET_THEME)
 
 
 def screens_available() -> bool:
@@ -767,7 +842,7 @@ def screens_available() -> bool:
     return bool(screens)
 
 
-def update(username: str, force: bool, dry: bool) -> int:
+def update(username: str, theme: dict[str, Any], force: bool, dry: bool) -> int:
     """Fetch, then refresh stale screens (or, with dry=True, only write preview.png).
 
     force=True ignores the ETag and up-to-date checks and re-renders and re-applies on
@@ -794,38 +869,67 @@ def update(username: str, force: bool, dry: bool) -> int:
             return EXIT_ERROR
         return EXIT_SKIPPED
     if not dry:
-        return apply_to_screens(cells, state, force)
+        return apply_to_screens(cells, state, force, theme)
     from AppKit import NSScreen  # dry run: render at the main screen's size, touch nothing else
 
     screen = NSScreen.mainScreen()
     width, height = backing_size(screen) if screen is not None else FALLBACK_SIZE
-    atomic_write_bytes(PREVIEW_FILE, render_png(cells, width, height))
+    atomic_write_bytes(PREVIEW_FILE, render_png(cells, width, height, theme))
     log.info("dry run: wrote %s (%dx%d, %d cells); wallpaper unchanged", PREVIEW_FILE, width, height, len(cells))
     return EXIT_OK
 
 
+def resolve_run(args: argparse.Namespace) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    """Read config.json once and validate the username and theme for this run, before any
+    fetch or state write. Returns (username, theme colours, config)."""
+    config = load_config()
+    username = resolve_username(args.user, config)
+    name = args.theme_name if args.theme is not None else saved_theme_name(config)
+    return username, resolve_theme(name), config
+
+
 def run(args: argparse.Namespace) -> int:
     """Dispatch to the requested mode, holding the lock where state is touched."""
-    if args.dry_run:  # writes only preview.png (and the log), so no lock is needed
-        return update(resolve_username(args.user), force=False, dry=True)
+    if args.dry_run:  # writes only preview.png (and the log), so no lock is needed; saves nothing
+        username, theme, _config = resolve_run(args)
+        return update(username, theme, force=False, dry=True)
     lock_fd = acquire_lock()
     if lock_fd is None:
         log.info("another run holds the lock; exiting")
         return EXIT_LOCK_BUSY if (args.restore or args.uninstall) else EXIT_SKIPPED
     try:  # the lock is held for the whole mode, including --uninstall's deletion
-        if args.restore:
+        if args.restore:  # restore and uninstall never read config.json, so a bad theme can't block them
             return restore()
         if args.uninstall:
             return uninstall()
-        return update(resolve_username(args.user), force=args.force, dry=False)
+        username, theme, config = resolve_run(args)
+        if args.theme is not None:
+            # Saved before fetching: config.json records the choice, state.json's `applied`
+            # records progress, so a skipped or failed run is completed by a later one.
+            save_theme(config, args.theme_name)
+        code = update(username, theme, force=args.force, dry=False)
+        if args.theme is not None and code == EXIT_SKIPPED:
+            log.info("theme saved; it will be applied on the next successful run")
+        return code
     finally:
         os.close(lock_fd)
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse, except usage errors exit 1: exit 2 means "skipped" (SPEC §3)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_ERROR, f"{self.prog}: error: {message}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments, run, and turn any error into one log line and exit code 1."""
-    parser = argparse.ArgumentParser(description="GitHub contribution graph as your macOS wallpaper.")
+    parser = ArgumentParser(description="GitHub contribution graph as your macOS wallpaper.")
     parser.add_argument("--user", metavar="NAME", help="override the username in config.json")
+    parser.add_argument("--theme", metavar="NAME",
+                        help="change the colour theme: saved to config.json and applied now; with "
+                             "--dry-run, only previewed; 'default' is the green look (see --list-themes)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="render preview.png only; do not set the wallpaper")
     mode.add_argument("--force", action="store_true",
@@ -836,7 +940,19 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--uninstall", action="store_true",
                       help="restore, verify no screen shows our image, then delete all our files "
                            "(used by uninstall.py)")
+    mode.add_argument("--list-themes", action="store_true", help="print the built-in theme names and exit")
     args = parser.parse_args(argv)
+    # Handled before logging starts, so these touch no files at all.
+    if args.list_themes:
+        print("\n".join(sorted(THEMES)))
+        return EXIT_OK
+    if args.theme is not None:
+        if args.restore or args.uninstall:
+            parser.error("--theme cannot be used with --restore or --uninstall")
+        try:
+            args.theme_name = normalize_theme_name(args.theme)
+        except ValueError as exc:
+            parser.error(str(exc))
     setup_logging()
     try:
         return run(args)
