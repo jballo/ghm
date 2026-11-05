@@ -570,9 +570,10 @@ def load_backup() -> list[dict[str, Any]] | None:
 def ensure_backup(workspace: Any, screens: list[Any], state: dict[str, Any]) -> None:
     """Add the original wallpaper of each connected screen not yet in backup.json (SPEC §9).
 
-    Existing entries are never modified (reinstalls keep the real original). Screens
-    already showing one of our PNGs are skipped. Raises if a screen can't be read or
-    backup.json is invalid; the caller then changes nothing.
+    Existing entries are never modified (reinstalls keep the real original), and a display
+    already in backup.json is not read at all. Screens already showing one of our PNGs are
+    skipped. Raises if a display not yet backed up can't be read, or backup.json is invalid;
+    the caller then changes nothing.
     """
     entries = load_backup() or []
     known = {entry["display"] for entry in entries}
@@ -711,8 +712,11 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, 
         live_before = None
     failed = False
     for index, screen in enumerate(screens):
+        # Reuse the snapshot read only while it is fresh: with settle=True each earlier set
+        # can wait up to APPLY_WAIT_SECONDS, during which this screen's Space may change.
+        current = before[index] if (not settle or index == 0) else _UNREAD
         try:
-            apply_to_screen(workspace, screen, cells, state, force, theme, settle, before[index])
+            apply_to_screen(workspace, screen, cells, state, force, theme, settle, current)
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True
@@ -896,6 +900,12 @@ class WatchCache:
         if self.lock_fd is not None:
             fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
 
+    def close(self) -> None:
+        """Close the lock file (releasing any lock held through it)."""
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
     def reload(self, config: dict[str, Any]) -> None:
         username = resolve_username(None, config)
         self.theme = resolve_theme(saved_theme_name(config))
@@ -939,6 +949,7 @@ def refresh_from_cache(cache: WatchCache | None = None) -> str:
     Quick path (the usual case): set each screen's recorded PNG straight away, even if the
     Space already shows it. Otherwise the normal apply path (§6), which reads first.
     """
+    owned = cache is None
     cache = cache if cache is not None else WatchCache()
     locked = False
     try:
@@ -961,11 +972,22 @@ def refresh_from_cache(cache: WatchCache | None = None) -> str:
             log.info("watch: no cached graph yet; the next scheduled run will set it")
             return REFRESH_DONE
         screens, workspace = screens_and_workspace()
-        targets = cache.quick_targets(screens) if screens else None
+        targets = None
+        if screens:
+            try:
+                targets = cache.quick_targets(screens)
+            except Exception as exc:  # noqa: BLE001 - the normal path isolates each display
+                log.warning("watch: quick path unavailable (%s: %s)", type(exc).__name__, exc)
         if targets is not None:
-            for screen, png in targets:
-                set_wallpaper(workspace, screen, png, {})
-            log.info("watch: set %s", ", ".join(os.path.basename(png) for _screen, png in targets))
+            done = []
+            for index, (screen, png) in enumerate(targets):
+                try:  # each display on its own, as in §6: one failing can't block the others
+                    set_wallpaper(workspace, screen, png, {})
+                    done.append(os.path.basename(png))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("watch: screen #%d: %s: %s", index, type(exc).__name__, exc)
+            if done:
+                log.info("watch: set %s", ", ".join(done))
             return REFRESH_DONE
         apply_to_screens(cache.cells, cache.state, force=False, theme=cache.theme, settle=False)
         cache.key = None  # apply may have written state.json / backup.json: reload next time
@@ -980,6 +1002,8 @@ def refresh_from_cache(cache: WatchCache | None = None) -> str:
                 cache.unlock()
             except OSError as exc:
                 log.error("watch: could not release the lock: %s", exc)
+        if owned:
+            cache.close()
 
 
 class SpaceRefresher:
@@ -987,9 +1011,10 @@ class SpaceRefresher:
 
     The refresh runs inside the notification callback, with no timer: macOS already reports
     the new Space's wallpaper by then (measured on macOS 27.2), and a refresh whose PNG exists
-    takes a few ms, so waiting would only add delay. Changes that arrive during a refresh are
-    queued by the run loop and each get their own (cheap) refresh. A new change cancels a
-    pending retry. `schedule(delay, fn)` runs fn on the main thread after `delay` seconds;
+    takes a few ms, so waiting would only add delay. A change that arrives while a refresh is
+    running (if the notification is delivered re-entrantly) is not run nested, which would
+    share and release the lock early; it marks one more refresh to run right after. A new
+    change cancels a pending retry. `schedule(delay, fn)` runs fn on the main thread after `delay` seconds;
     `refresh()` returns a REFRESH_* value; `stop()` ends the event loop. Free of AppKit, so it
     can be tested.
     """
@@ -999,30 +1024,48 @@ class SpaceRefresher:
         self.schedule, self.refresh, self.stop = schedule, refresh, stop
         self.generation = 0      # bumped by every change; a retry from an older one does nothing
         self.attempts = 0
+        self.running = False     # a refresh is in progress
+        self.again = False       # a change arrived during it: refresh once more afterwards
 
     def space_changed(self) -> None:
         self.generation += 1
         self.attempts = 0
+        if self.running:
+            self.again = True
+            return
         self._run()
 
     def _retry(self, generation: int) -> None:
-        if generation == self.generation:
-            self._run()
+        if generation != self.generation:
+            return
+        if self.running:
+            self.again = True
+            return
+        self._run()
 
     def _run(self) -> None:
-        result = self.refresh()
-        if result == REFRESH_STOP:
-            self.stop()
-        elif result == REFRESH_RETRY:
-            self.attempts += 1
-            if self.attempts < WATCH_RETRY_ATTEMPTS:
-                generation = self.generation
-                self.schedule(WATCH_RETRY_SECONDS, lambda: self._retry(generation))
-            else:
-                log.warning("watch: lock stayed busy; waiting for the next Space change")
+        self.running = True
+        try:
+            while True:
+                self.again = False
+                result = self.refresh()
+                if result == REFRESH_STOP:
+                    self.stop()
+                    return
+                if result == REFRESH_RETRY:  # a later retry covers any change marked meanwhile
+                    self.attempts += 1
+                    if self.attempts < WATCH_RETRY_ATTEMPTS:
+                        generation = self.generation
+                        self.schedule(WATCH_RETRY_SECONDS, lambda: self._retry(generation))
+                    else:
+                        log.warning("watch: lock stayed busy; waiting for the next Space change")
+                        self.attempts = 0
+                    return
                 self.attempts = 0
-        else:
-            self.attempts = 0
+                if not self.again:
+                    return
+        finally:
+            self.running = False
 
 
 def watch_spaces() -> int:

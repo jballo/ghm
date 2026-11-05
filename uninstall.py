@@ -78,13 +78,25 @@ def run_heatmap_uninstall() -> int:
 
 def main() -> int:
     """Unschedule, then hand restore + verify + delete to heatmap.py; propagate its result."""
-    # 1-2. Stop the scheduled job and the Space watcher (ignore failure: they may not be
-    #      loaded) and remove their plists, whatever happens next, so nothing runs again.
-    #      The watcher must be gone before restoring, or a Space switch would re-apply.
+    # 1-2. Stop the scheduled job and the Space watcher and remove their plists, so nothing
+    #      runs again. bootout fails harmlessly for a job that isn't loaded, so `launchctl
+    #      print` checks that each is really gone; one still loaded could put the heatmap
+    #      back after the restore (the watcher on the next Space switch), so stop there.
+    domain = f"gui/{os.getuid()}"
+    still_loaded = []
     for label, plist in ((LABEL, PLIST_PATH), (WATCH_LABEL, WATCH_PLIST_PATH)):
-        subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{label}"], check=False, capture_output=True)
+        subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{label}"], check=False, capture_output=True)
+        if subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], check=False,
+                          capture_output=True).returncode == 0:
+            still_loaded.append(label)
+            continue  # keep its plist: the job is still there
         plist.unlink(missing_ok=True)
         print(f"==> unloaded {label} (if it was loaded) and deleted {plist}")
+    if still_loaded:
+        for label in still_loaded:
+            print(f"Could not stop {label}; it is still loaded. Try `launchctl bootout {domain}/{label}`.")
+        print("Nothing was restored or deleted. Run uninstall.py again once it is stopped.")
+        return 1
 
     # 3. Without the venv we can neither restore nor check the screens: delete nothing.
     if not VENV_PYTHON.exists():

@@ -150,9 +150,23 @@ def build_watch_plist() -> dict:
     }
 
 
+def is_loaded(domain: str, label: str) -> bool:
+    """True if launchd still has the job (`launchctl print` succeeds only for a loaded job)."""
+    return subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], check=False,
+                          capture_output=True).returncode == 0
+
+
 def remove_watcher(domain: str) -> None:
-    """Stop the Space watcher (ignore failure: it may not be loaded) and delete its plist."""
+    """Stop the Space watcher and delete its plist; exit if it is still loaded afterwards.
+
+    bootout fails harmlessly when the job isn't loaded, so its exit code alone can't tell
+    "already gone" from "failed to stop"; `launchctl print` decides. The plist is kept if the
+    job is still loaded, so the state stays visible and a re-run can try again.
+    """
     subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+    if is_loaded(domain, WATCH_LABEL):
+        sys.exit(f"could not stop {WATCH_LABEL} (still loaded); try `launchctl bootout "
+                 f"{domain}/{WATCH_LABEL}`, then run install.py again")
     if WATCH_PLIST_PATH.exists():
         WATCH_PLIST_PATH.unlink()
         print(f"==> stopped {WATCH_LABEL} and removed {WATCH_PLIST_PATH}")
@@ -238,6 +252,9 @@ def main() -> int:
     watch = WATCH_PLIST_PATH.exists() if args.watch_spaces is None else args.watch_spaces
     if watch:
         subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+        if is_loaded(domain, WATCH_LABEL):  # the old one didn't stop: don't touch its plist
+            sys.exit(f"{LABEL} is installed, but the running {WATCH_LABEL} could not be stopped "
+                     f"to reload it; try `launchctl bootout {domain}/{WATCH_LABEL}`, then run install.py again")
         atomic_write_bytes(WATCH_PLIST_PATH, plistlib.dumps(build_watch_plist()))
         loaded = subprocess.run([LAUNCHCTL, "bootstrap", domain, str(WATCH_PLIST_PATH)], check=False)
         if loaded.returncode != 0:

@@ -303,8 +303,10 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   original), and a display first connected later still gets its original saved. Don't
   write an empty backup. `state.json["backup_not_needed"]` is `true` only when
   `backup.json` has no entries and none were added because every connected screen
-  already shows one of ours; otherwise `false`. If any screen can't be read, or
-  `backup.json` is invalid, change nothing and exit 1.
+  already shows one of ours; otherwise `false`. A display already in `backup.json` is
+  not read for the backup. If a display not yet backed up can't be read, or
+  `backup.json` is invalid, change nothing and exit 1. (A later read failure on one
+  screen is handled by that screen's own error boundary, §6 step 4.)
 - **Validation.** A missing `backup.json` means "no backup". An existing one must be a
   list. Each entry must be an object with `display` (int), `path` (string or null) and
   `options` (object whose values are int/float/bool/str), and display ids must not
@@ -369,12 +371,15 @@ install.py --user NAME [--theme NAME] [--interval 600] [--watch-spaces | --no-wa
    `launchctl bootstrap gui/$UID <plist>` with `check=True`.
 6a. Space watcher (§13): on with `--watch-spaces`; with no flag, keep what a previous
    install chose (its plist exists or not). If on: `bootout
-   gui/$UID/local.gh-heatmap.spaces` (ignore failure), write
+   gui/$UID/local.gh-heatmap.spaces`; if `launchctl print` still finds it, exit 1 and
+   leave its plist alone; else write
    `~/Library/LaunchAgents/local.gh-heatmap.spaces.plist`, `bootstrap` it; if that
    bootstrap fails, delete the plist and exit 1 saying the main agent is installed but
    the watcher is not. `--no-watch-spaces` is not handled here but right after step 1
-   (bootout, delete the plist), before `uv sync`, so turning the watcher off never
-   depends on the first run or GitHub.
+   (bootout; if `launchctl print` still finds the job, exit 1 keeping its plist; else
+   delete the plist), before `uv sync`, so turning the watcher off never depends on the
+   first run or GitHub. (bootout fails harmlessly for a job that isn't loaded, so its
+   exit code can't tell "already gone" from "failed to stop"; `launchctl print` can.)
 7. Print what was installed and how to uninstall.
 
 ## 11. `uninstall.py`
@@ -385,10 +390,11 @@ deletes the support dir or logs itself.
 
 `uninstall.py`:
 
-1. `launchctl bootout gui/$UID/local.gh-heatmap` and `gui/$UID/local.gh-heatmap.spaces`
-   (ignore failures). The watcher must be stopped before restoring, or a Space switch
-   would put the heatmap back.
-2. Delete both plists. Steps 1–2 always happen, so nothing runs again.
+1. `launchctl bootout gui/$UID/local.gh-heatmap` and `gui/$UID/local.gh-heatmap.spaces`,
+   then check each with `launchctl print`. The watcher must be stopped before restoring,
+   or a Space switch would put the heatmap back.
+2. Delete the plist of each job that is gone. If either job is still loaded, keep its
+   plist, say which one and how to stop it, restore and delete nothing, and exit 1.
 3. If `.venv/bin/python` is missing: say that the wallpaper can't be restored or verified
    safely, print the original paths from `backup.json` (plain JSON read), tell the user
    to run `uv sync --locked` and then uninstall.py again, and exit 1 with everything else
@@ -483,8 +489,9 @@ lock, several displays or system load can add delay.
 - **No debounce.** The refresh runs inside the notification callback. Measured on macOS
   27.2: `desktopImageURLForScreen_` already reports the new Space's wallpaper when the
   notification arrives, and a refresh whose PNG exists takes ~5 ms, so waiting would only
-  add delay (a first version waited 1 s, which users noticed). Notifications that arrive
-  during a refresh are queued by the run loop and each get their own cheap refresh.
+  add delay (a first version waited 1 s, which users noticed). A refresh never runs
+  nested inside another: if a change is delivered while one is running, it marks one more
+  refresh to run right after (a nested one would share the lock fd and unlock it early).
 - **No post-set wait.** The watcher passes `settle=False`, skipping the up-to-2 s
   read-back poll of §8 that scheduled runs do, so a slow read-back can't hold up the next
   Space change.
@@ -493,7 +500,9 @@ lock, several displays or system load can add delay.
   transition. A refresh reads each screen's path once (the prune snapshot) and passes it
   to the up-to-date check, and `ensure_backup` reads a path only for a display not yet in
   `backup.json`. Before this, three reads could delay the set by ~100 ms. Scheduled runs
-  use the same code. The watcher's quick path (below) skips even that one read.
+  use the same code, but there a screen after the first is read again (the run may have
+  waited up to 2 s after the previous set, and that screen's Space may have changed).
+  The watcher's quick path (below) skips even that one read.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
   every 5 s, up to 12 tries, then wait for the next change. Under the lock: if
   `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else use the
@@ -505,7 +514,8 @@ lock, several displays or system load can add delay.
     PNG exists. Then set that PNG on each screen straight away, without first asking
     macOS what the Space shows, even if it already shows it; no render, backup or state
     change is needed. Setting the image a Space already shows is invisible (checked by
-    eye on macOS 27.2).
+    eye on macOS 27.2). Each display is set inside its own error boundary, so one failing
+    can't block the others; if working out the targets fails, the normal path runs.
   - **Otherwise** (new data, a new theme not yet applied, an unrendered PNG, a display
     not yet backed up): the normal per-display apply and prune (§6 steps 1–5), then the
     cache is reloaded on the next refresh. It **never fetches**, so it
