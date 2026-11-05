@@ -1,0 +1,12 @@
+[project]
+name = "gh-heatmap"
+version = "0.1.0"
+description = "Your GitHub contribution heatmap as your macOS desktop wallpaper"
+requires-python = ">=3.13"
+dependencies = [
+    "pillow>=11",
+    "pyobjc-framework-Cocoa>=11",
+]
+
+[tool.uv]
+package = false

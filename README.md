@@ -1,0 +1,91 @@
+# gh-heatmap
+
+Your public GitHub contribution graph as your macOS desktop wallpaper: black
+background, green squares, refreshed every 10 minutes by a per-user launchd job.
+No GitHub token; it reads only `https://github.com/users/<username>/contributions`.
+Design contract: [SPEC.md](SPEC.md).
+
+## Install / uninstall
+
+Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
+
+```sh
+python3 install.py --user YOUR_GITHUB_NAME     # optional: --interval 600
+python3 uninstall.py
+```
+
+`install.py` runs `uv sync --locked`, writes your config, runs the tool once by hand
+(this changes your wallpaper and saves the original), then loads the LaunchAgent. It
+schedules nothing unless that first run succeeds and the original wallpaper was saved.
+`uninstall.py` unloads and deletes the agent, then runs `heatmap.py --uninstall`. That
+restores the original wallpaper and deletes the files below (except the empty lock file), holding the lock the
+whole time. It deletes nothing while any display still shows a heatmap image. In that
+case it names those displays, opens Wallpaper settings, prints your original wallpaper
+paths and exits 1. Re-pick a wallpaper there, then run `uninstall.py` again. That is
+always safe to repeat. Without `.venv` it deletes nothing and asks you to run
+`uv sync --locked` first.
+
+To try it without changing anything:
+
+```sh
+uv run heatmap.py --dry-run --user YOUR_GITHUB_NAME
+open ~/Library/Application\ Support/gh-heatmap/preview.png
+```
+
+Other flags: `--force` (skip the ETag and up-to-date checks and re-render on every display;
+it still respects a GitHub backoff and still falls back to cached data when offline) and
+`--restore` (put the saved wallpaper back; deletes nothing). Exit codes: 0 means OK,
+1 means error, 2 means skipped (no screens, backoff, or another run in progress), and 3
+means `--restore`/`--uninstall` found the lock busy.
+
+## Files it creates
+
+```
+~/Library/Application Support/gh-heatmap/   config.json, state.json, backup.json,
+                                            heatmap-<hash>.png, preview.png
+~/Library/Application Support/gh-heatmap.lock   empty lock file; uninstall leaves it on
+                                            purpose, so every run shares one lock
+~/Library/Logs/gh-heatmap.log               (plus rotated .1-.3, 512 KiB each)
+~/Library/Logs/gh-heatmap.launchd.log       launchd stdout/stderr; should stay empty
+~/Library/LaunchAgents/local.gh-heatmap.plist
+```
+
+Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edits.
+
+## Limitations
+
+- **Current Space only.** macOS has no public API to set the wallpaper on every
+  Space, so each screen's *current* Space is updated. Other Spaces keep their own
+  wallpaper.
+- Restore is best-effort for static images. A dynamic wallpaper, a slideshow or a
+  missing file can't be put back automatically, so the Wallpaper settings pane
+  opens and you re-pick it there.
+- If you change the wallpaper by hand, the next run (within 10 minutes) sets the
+  heatmap again. That is the tool's job. Uninstall to stop it.
+
+## Recovery
+
+The `.venv` interpreter is managed by uv and lives under `~/.local/share/uv/python`. If
+it disappears, or `heatmap.py` stops running (check `~/Library/Logs/gh-heatmap.launchd.log`
+and `~/Library/Logs/gh-heatmap.log`), run this in the project folder:
+
+```sh
+uv sync --locked
+python3 install.py --user YOUR_GITHUB_NAME
+```
+
+A reinstall never overwrites an existing `backup.json`, so your real original wallpaper
+is kept.
+
+## Auditing
+
+- All the logic is in `heatmap.py`, one file that imports only the standard
+  library plus Pillow (for drawing) and PyObjC's AppKit/Foundation (for setting the
+  wallpaper). It makes no subprocess calls. Its only network request is the one GET above,
+  and it refuses any redirect off `https://github.com/`.
+- `install.py` and `uninstall.py` are standard-library only. Their only subprocess
+  calls are `uv sync --locked`, `/bin/launchctl bootout|bootstrap`, and
+  `.venv/bin/python heatmap.py [--uninstall]`. `uninstall.py` deletes only the plist; the support dir and logs are deleted only by `heatmap.py --uninstall`.
+- Dependencies are `pillow` and `pyobjc-framework-Cocoa` (which pulls in `pyobjc-core`).
+  `uv.lock` pins every wheel with a sha256 hash, and `uv sync --locked` refuses to run
+  if the lock is out of date with `pyproject.toml`.
