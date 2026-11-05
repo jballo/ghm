@@ -5,6 +5,8 @@ background, green squares, refreshed every 10 minutes by a per-user launchd job.
 No GitHub token; it reads only `https://github.com/users/<username>/contributions`.
 Design contract: [SPEC.md](SPEC.md).
 
+![gh-heatmap as the macOS desktop wallpaper](docs/screenshot.png)
+
 ## Install / uninstall
 
 Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
