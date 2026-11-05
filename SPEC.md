@@ -444,7 +444,7 @@ restore, so a later run deletes whatever remains.
 4b. `install.py --user jballo --watch-spaces` → `launchctl print gui/$UID/local.gh-heatmap.spaces`
     shows it running; log says `watch: watching for Space changes`. With 2+ desktops:
     `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there right after
-    the swipe ends (log: `set` within ~50 ms of the switch), and no fetch for it. Switch with the network off → still updates.
+    the swipe ends (the set happens ~5–15 ms after the switch), and no fetch for it. Switch with the network off → still updates.
     `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
 
@@ -453,7 +453,7 @@ restore, so a later run deletes whatever remains.
 macOS has no public API to set every Space's wallpaper, but it does announce, through
 public AppKit API, when the active Space changes. The watcher listens for that and
 re-applies the graph, so the Space you switch to is updated as soon as you arrive
-(measured on macOS 27.2: the wallpaper is set 40–65 ms after the notification) instead
+(measured on macOS 27.2: the set call starts 4–12 ms after the notification) instead
 of at the next scheduled run. What is still visible is macOS's own part: the
 notification comes only once the swipe has finished, so the swipe shows the Space's
 old image, and macOS then fades to the new one. Public API can't avoid either; only
@@ -488,6 +488,12 @@ lock, several displays or system load can add delay.
 - **No post-set wait.** The watcher passes `settle=False`, skipping the up-to-2 s
   read-back poll of §8 that scheduled runs do, so a slow read-back can't hold up the next
   Space change.
+- **One path read before the set.** Right after a Space change,
+  `desktopImageURLForScreen_` can take 20–55 ms per call while macOS is busy with the
+  transition. A refresh reads each screen's path once (the prune snapshot) and passes it
+  to the up-to-date check, and `ensure_backup` reads a path only for a display not yet in
+  `backup.json`. Before this, three reads could delay the set by ~100 ms. Scheduled runs
+  use the same code.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
   every 5 s, up to 12 tries, then wait for the next change. Under the lock: if
   `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else read the

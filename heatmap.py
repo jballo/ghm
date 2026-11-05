@@ -579,8 +579,10 @@ def ensure_backup(workspace: Any, screens: list[Any], state: dict[str, Any]) -> 
     added = []
     for screen in screens:
         did = display_id(screen)
+        if did in known:
+            continue  # checked first: right after a Space change, reading the path can take ~50 ms
         path = wallpaper_path(workspace, screen)
-        if did in known or (path is not None and is_ours(path)):
+        if path is not None and is_ours(path):
             continue
         options = json_safe_options(workspace.desktopImageOptionsForScreen_(screen))
         added.append({"display": did, "path": path, "options": options})
@@ -643,18 +645,25 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
         log.info("pruned %s", png.name)
 
 
+_UNREAD = object()  # apply_to_screen: "current path not read yet" (None means "no wallpaper")
+
+
 def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: dict[str, Any],
-                    force: bool, theme: dict[str, Any], settle: bool = True) -> None:
+                    force: bool, theme: dict[str, Any], settle: bool = True,
+                    current: Any = _UNREAD) -> None:
     """Render (if needed) and set one screen's wallpaper, then record it; raise on failure.
 
     settle=False skips the post-set read-back wait (the watcher, SPEC §13: it must not block
     the next Space change for up to APPLY_WAIT_SECONDS, and no run follows it seconds later).
+    `current` is the screen's wallpaper path if the caller already read it this run, so it
+    isn't asked for twice (each read can take ~50 ms right after a Space change).
     """
     key = str(display_id(screen))
     width, height = backing_size(screen)
     digest = render_hash(cells, width, height, theme)
     png = SUPPORT_DIR / f"heatmap-{digest}.png"
-    current = wallpaper_path(workspace, screen)
+    if current is _UNREAD:
+        current = wallpaper_path(workspace, screen)
     up_to_date = (state["applied"].get(key) == digest and png.exists() and current is not None
                   and os.path.realpath(current) == os.path.realpath(png))
     if up_to_date and not force:
@@ -693,15 +702,17 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, 
     except Exception as exc:
         log.error("could not save the original wallpapers (%s: %s); changing nothing", type(exc).__name__, exc)
         return EXIT_ERROR
-    try:
-        live_before: list[str] | None = [p for p in (wallpaper_path(workspace, s) for s in screens) if p]
+    try:  # one read per screen, used both for prune's snapshot and for the up-to-date check
+        before: list[Any] = [wallpaper_path(workspace, s) for s in screens]
+        live_before: list[str] | None = [p for p in before if p]
     except Exception as exc:
         log.warning("could not read current wallpapers (%s)", exc)
+        before = [_UNREAD] * len(screens)
         live_before = None
     failed = False
     for index, screen in enumerate(screens):
         try:
-            apply_to_screen(workspace, screen, cells, state, force, theme, settle)
+            apply_to_screen(workspace, screen, cells, state, force, theme, settle, before[index])
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True

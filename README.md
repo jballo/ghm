@@ -91,7 +91,7 @@ Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edit
 - **Optional: update a Space as you switch to it.** `install.py --watch-spaces` adds a
   small process that stays running (about 85 MB of memory, no CPU while idle). When you
   switch Spaces, macOS tells it, and it re-applies the last downloaded graph within
-  about 50 ms, with no network request. You still see the old image during the swipe
+  about 10 ms, with no network request. You still see the old image during the swipe
   and a short macOS fade to the new one: macOS only says you switched once you've
   arrived. Spaces you don't visit still keep their old image.
   Turn it off with `install.py --user YOUR_GITHUB_NAME --no-watch-spaces`; a reinstall
