@@ -44,7 +44,8 @@ Runtime files (all created by `heatmap.py`):
                        `heatmap.py --theme`; "theme" is absent for the default look
   state.json           see §6
   backup.json          original wallpaper per display, captured once, before first change
-  heatmap-<hash>.png   rendered wallpapers (current + previous kept, rest pruned)
+  heatmap-<hash>.png   rendered wallpapers (current, previous, live, and up to 50 more
+                       from the last 14 days kept; the rest pruned, see §6)
 ~/Library/Application Support/gh-heatmap.lock
                        flock file, held for the whole of every run (including --uninstall).
                        It sits NEXT TO the support dir, never inside it, and is never
@@ -190,6 +191,17 @@ Per display, per run:
    every PNG named by `applied_prev`, and every one of ours that is the live wallpaper of
    any screen, both in the snapshot taken before this run and freshly queried from every
    screen at prune time. If either screen query fails, skip pruning entirely.
+   Protected PNGs are never deleted and never count against the cap below.
+   Of the unprotected rest, also keep the `RETAIN_EXTRA` (50) newest whose own mtime
+   (`os.lstat`, symlinks not followed) is within `RETAIN_DAYS` (14 days); ties broken by
+   file name. A PNG whose mtime can't be read is kept. Everything else is deleted.
+   Why: we can only see each screen's *current* Space (§8), but other Spaces, and
+   displays that are not connected, keep pointing at the PNG they last showed. A new PNG
+   appears whenever the graph's levels, its date window, the screen size or the theme
+   change, so keeping only current + previous left most other Spaces pointing at deleted
+   files. Retention makes that rare; it can't rule it out (a Space left alone for more
+   than 14 days or 50 renders can still point at a deleted PNG). PNGs are ~32 KB, so
+   the cap costs under ~2 MB. mtime is the render time; it is never touched afterwards.
 
 Concurrency: `fcntl.flock(LOCK_EX | LOCK_NB)` on `gh-heatmap.lock` (§2; its parent dir is
 created first); if busy, log and exit 2
@@ -257,7 +269,12 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   - in `--uninstall` verification (§11): up to 5 s for a display that reads as ours to
     stop being ours, before it counts as "still ours".
 - Known limit (documented in README): this sets the wallpaper for the *current
-  Space* on each screen only. Apple has no public API for all Spaces.
+  Space* on each screen only. Apple has no public API for all Spaces, or to list
+  other Spaces' wallpapers. Another Space (or a display that is not connected) keeps
+  its old heatmap until a run finds it current: normally the next successful run
+  while you are on that Space, but a GitHub backoff, sleep, a busy lock or a failed
+  run can delay that. Running `heatmap.py` by hand fixes the current Space at once.
+  Retention in §6 step 5 keeps the PNGs those Spaces point at for a while.
 
 ## 9. Backup and restore
 
@@ -386,6 +403,10 @@ restore, so a later run deletes whatever remains.
    (most recent week at the right, Sunday on top).
 2. `uv run heatmap.py --user jballo` → wallpaper changes; `backup.json` exists.
 3. Run again → log says skipped (nothing changed), no new PNG.
+3a. With 2+ desktops: on desktop 1 run `heatmap.py --theme nord`, then `--theme dracula`,
+    then `--theme default`. All three PNGs are still in the support dir (nothing
+    pruned). Swipe to desktop 2 → it still shows its old image until a run happens there;
+    `uv run heatmap.py` on desktop 2 updates it.
 4. `install.py --user jballo` → `launchctl print gui/$UID/local.gh-heatmap` shows it loaded;
    wait ≤10 min, log shows a run from launchd.
 4a. `install.py --user jballo --theme dracula` → Dracula on every display, config.json has
