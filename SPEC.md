@@ -444,7 +444,7 @@ restore, so a later run deletes whatever remains.
 4b. `install.py --user jballo --watch-spaces` → `launchctl print gui/$UID/local.gh-heatmap.spaces`
     shows it running; log says `watch: watching for Space changes`. With 2+ desktops:
     `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there right after
-    the swipe ends (the set happens ~5–15 ms after the switch), and no fetch for it. Switch with the network off → still updates.
+    the swipe ends (the set happens a few ms after the switch), and no fetch for it. Switch with the network off → still updates.
     `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
 
@@ -453,7 +453,7 @@ restore, so a later run deletes whatever remains.
 macOS has no public API to set every Space's wallpaper, but it does announce, through
 public AppKit API, when the active Space changes. The watcher listens for that and
 re-applies the graph, so the Space you switch to is updated as soon as you arrive
-(measured on macOS 27.2: the set call starts 4–12 ms after the notification) instead
+(measured on macOS 27.2: the set call usually starts 0.3–3.5 ms after the notification) instead
 of at the next scheduled run. What is still visible is macOS's own part: the
 notification comes only once the swipe has finished, so the swipe shows the Space's
 old image, and macOS then fades to the new one. Public API can't avoid either; only
@@ -493,12 +493,22 @@ lock, several displays or system load can add delay.
   transition. A refresh reads each screen's path once (the prune snapshot) and passes it
   to the up-to-date check, and `ensure_backup` reads a path only for a display not yet in
   `backup.json`. Before this, three reads could delay the set by ~100 ms. Scheduled runs
-  use the same code.
+  use the same code. The watcher's quick path (below) skips even that one read.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
   every 5 s, up to 12 tries, then wait for the next change. Under the lock: if
-  `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else read the
-  username and theme from it, load `state.json`, and if it has cached cells, run the
-  normal per-display apply and prune (§6 steps 1–5) with them. It **never fetches**, so it
+  `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else use the
+  username, theme, `state.json` and validated cells from `WatchCache`, which reloads them
+  only when `config.json`, `state.json` or `backup.json` change (inode, mtime, size) or the
+  date changes. The lock file stays open; each refresh only flocks and unflocks it.
+  - **Quick path** (the usual case): every connected display is already in `backup.json`,
+    `state.json` `applied` records the PNG for the current cells, size and theme, and that
+    PNG exists. Then set that PNG on each screen straight away, without first asking
+    macOS what the Space shows, even if it already shows it; no render, backup or state
+    change is needed. Setting the image a Space already shows is invisible (checked by
+    eye on macOS 27.2).
+  - **Otherwise** (new data, a new theme not yet applied, an unrendered PNG, a display
+    not yet backed up): the normal per-display apply and prune (§6 steps 1–5), then the
+    cache is reloaded on the next refresh. It **never fetches**, so it
   makes no network request and is unaffected by a GitHub backoff; the scheduled run keeps
   the cache fresh. No cached cells yet: log and do nothing. Any error is logged and the
   watcher keeps running.

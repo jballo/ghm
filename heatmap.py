@@ -853,37 +853,133 @@ WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wai
 REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
 
 
-def refresh_from_cache() -> str:
+class WatchCache:
+    """What a watcher refresh needs, kept between Space changes (SPEC §13).
+
+    The lock file stays open (only flock/unflock per refresh). Config, theme, state and
+    validated cells are reloaded only when config.json, state.json or backup.json change
+    (checked by inode, mtime and size: microseconds) or the date changes.
+    """
+
+    def __init__(self) -> None:
+        self.lock_fd: int | None = None
+        self.key: Any = None
+        self.theme: dict[str, Any] = {}
+        self.state: dict[str, Any] = {}
+        self.cells: dict[str, int] | None = None
+        self.backed_up: set[int] = set()
+        self.digests: dict[tuple[int, int, int], str] = {}
+
+    @staticmethod
+    def files_key() -> Any:
+        parts = []
+        for path in (CONFIG_FILE, STATE_FILE, BACKUP_FILE):
+            try:
+                st = os.stat(path)
+                parts.append((st.st_ino, st.st_mtime_ns, st.st_size))
+            except FileNotFoundError:
+                parts.append(None)
+        return tuple(parts), dt.date.today()
+
+    def lock(self) -> bool:
+        """Take the lock without blocking; False if another run holds it."""
+        if self.lock_fd is None:
+            LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def unlock(self) -> None:
+        if self.lock_fd is not None:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+
+    def reload(self, config: dict[str, Any]) -> None:
+        username = resolve_username(None, config)
+        self.theme = resolve_theme(saved_theme_name(config))
+        self.state = load_state(username)
+        cached = self.state.get("cells")
+        self.cells = validate_cells(cached, dt.date.today()) if cached else None
+        self.backed_up = {entry["display"] for entry in (load_backup() or [])}
+        self.digests = {}
+
+    def quick_targets(self, screens: list[Any]) -> list[tuple[Any, str]] | None:
+        """(screen, PNG) for every screen if the quick path applies, else None.
+
+        Applies when each display is already in backup.json, state.json says it shows the
+        PNG for the current cells/size/theme, and that PNG exists: then setting it needs no
+        render, no backup and no state change, so it can be set without first asking macOS
+        what the Space shows (that read can take ~2-8 ms right after a switch).
+        """
+        targets = []
+        for screen in screens:
+            did = display_id(screen)
+            width, height = backing_size(screen)
+            if did not in self.backed_up:
+                return None
+            digest = self.digests.get((did, width, height))
+            if digest is None:
+                digest = self.digests[(did, width, height)] = render_hash(self.cells, width, height, self.theme)
+            png = SUPPORT_DIR / f"heatmap-{digest}.png"
+            if self.state["applied"].get(str(did)) != digest or not png.exists():
+                return None
+            targets.append((screen, str(png)))
+        return targets
+
+
+def refresh_from_cache(cache: WatchCache | None = None) -> str:
     """Re-apply the cached graph to every screen's current Space; never makes a network request.
 
     Takes the lock for the duration. Returns REFRESH_RETRY if another run holds it,
     REFRESH_STOP if config.json is gone (uninstalled), else REFRESH_DONE. Errors are logged,
     never raised (lock errors included), so one bad refresh can't stop the watcher.
+
+    Quick path (the usual case): set each screen's recorded PNG straight away, even if the
+    Space already shows it. Otherwise the normal apply path (§6), which reads first.
     """
-    lock_fd = None
+    cache = cache if cache is not None else WatchCache()
+    locked = False
     try:
-        lock_fd = acquire_lock()
-        if lock_fd is None:
+        if not cache.lock():
             return REFRESH_RETRY
-        config = load_config()
-        if config is None:
+        locked = True
+        key = cache.files_key()
+        if key[0][0] is None:
             log.info("watch: config.json is gone (uninstalled?); stopping")
             return REFRESH_STOP
-        username = resolve_username(None, config)
-        theme = resolve_theme(saved_theme_name(config))
-        state = load_state(username)
-        if not state.get("cells"):
+        if key != cache.key:
+            config = load_config()
+            if config is None:
+                log.info("watch: config.json is gone (uninstalled?); stopping")
+                return REFRESH_STOP
+            cache.key = None  # stays invalid if reload fails
+            cache.reload(config)
+            cache.key = key
+        if not cache.cells:
             log.info("watch: no cached graph yet; the next scheduled run will set it")
             return REFRESH_DONE
-        cells = validate_cells(state["cells"], dt.date.today())
-        apply_to_screens(cells, state, force=False, theme=theme, settle=False)
+        screens, workspace = screens_and_workspace()
+        targets = cache.quick_targets(screens) if screens else None
+        if targets is not None:
+            for screen, png in targets:
+                set_wallpaper(workspace, screen, png, {})
+            log.info("watch: set %s", ", ".join(os.path.basename(png) for _screen, png in targets))
+            return REFRESH_DONE
+        apply_to_screens(cache.cells, cache.state, force=False, theme=cache.theme, settle=False)
+        cache.key = None  # apply may have written state.json / backup.json: reload next time
         return REFRESH_DONE
     except Exception as exc:  # noqa: BLE001 - logged; the watcher keeps running
         log.error("watch: refresh failed: %s: %s", type(exc).__name__, exc)
+        cache.key = None
         return REFRESH_DONE
     finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
+        if locked:
+            try:
+                cache.unlock()
+            except OSError as exc:
+                log.error("watch: could not release the lock: %s", exc)
 
 
 class SpaceRefresher:
@@ -968,8 +1064,9 @@ def watch_spaces() -> int:
     # (a refresh in progress finishes first) and wakes the idle loop at once.
     for signum in (signal.SIGTERM, signal.SIGINT):
         MachSignals.signal(signum, lambda _signum: stop())
+    cache = WatchCache()
     refresher = SpaceRefresher(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
-                               refresh=refresh_from_cache, stop=stop)
+                               refresh=lambda: refresh_from_cache(cache), stop=stop)
     center = NSWorkspace.sharedWorkspace().notificationCenter()
     token = center.addObserverForName_object_queue_usingBlock_(
         NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: refresher.space_changed())
