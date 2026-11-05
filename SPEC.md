@@ -270,7 +270,8 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   after a successful set (observed: still stale 175 ms after a restore),
   `desktopImageURLForScreen_` can keep returning the *old* path. So every read that
   follows a set polls `wallpaper_path()` every 0.25 s, comparing by `realpath`:
-  - after setting a heatmap: up to 2 s, so a run seconds later sees it as up to date.
+  - after setting a heatmap: up to 2 s, so a run seconds later sees it as up to date
+    (scheduled and manual runs; the Space watcher skips this wait, §13).
     If it never settles, log at debug only; the set succeeded. The up-to-date skip rule
     itself is unchanged.
   - These post-set waits are read-only and are wrapped in their own exception boundary:
@@ -442,8 +443,8 @@ restore, so a later run deletes whatever remains.
     change nothing.
 4b. `install.py --user jballo --watch-spaces` → `launchctl print gui/$UID/local.gh-heatmap.spaces`
     shows it running; log says `watch: watching for Space changes`. With 2+ desktops:
-    `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there after about a
-    second, and the log shows no fetch for it. Switch with the network off → still updates.
+    `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there right after
+    the swipe ends (log: `set` within ~50 ms of the switch), and no fetch for it. Switch with the network off → still updates.
     `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
 
@@ -451,9 +452,13 @@ restore, so a later run deletes whatever remains.
 
 macOS has no public API to set every Space's wallpaper, but it does announce, through
 public AppKit API, when the active Space changes. The watcher listens for that and
-re-applies the graph, so the Space you switch to is usually updated about a second
-after you stop switching, instead of at the next scheduled run. (The 1 s is a debounce,
-not a guarantee: a busy lock, several displays or system load add to it.)
+re-applies the graph, so the Space you switch to is updated as soon as you arrive
+(measured on macOS 27.2: the wallpaper is set 40–65 ms after the notification) instead
+of at the next scheduled run. What is still visible is macOS's own part: the
+notification comes only once the swipe has finished, so the swipe shows the Space's
+old image, and macOS then fades to the new one. Public API can't avoid either; only
+setting a Space before you visit it could, and there is no public API for that. A busy
+lock, several displays or system load can add delay.
 
 - **Opt-in.** `install.py --watch-spaces` (§10 step 6a). The default install has no
   resident process (§1).
@@ -475,8 +480,14 @@ not a guarantee: a busy lock, several displays or system load add to it.)
   notifications but never this one. Nothing else is observed. Stopping uses
   `NSApp.stop_` plus a posted application-defined event so `run()` returns at once
   (`terminate_` would `exit()` and skip cleanup).
-- **Debounce.** Each notification (re)arms a 1 s timer; only the last one in a burst runs
-  a refresh, so swiping across several Spaces does one refresh.
+- **No debounce.** The refresh runs inside the notification callback. Measured on macOS
+  27.2: `desktopImageURLForScreen_` already reports the new Space's wallpaper when the
+  notification arrives, and a refresh whose PNG exists takes ~5 ms, so waiting would only
+  add delay (a first version waited 1 s, which users noticed). Notifications that arrive
+  during a refresh are queued by the run loop and each get their own cheap refresh.
+- **No post-set wait.** The watcher passes `settle=False`, skipping the up-to-2 s
+  read-back poll of §8 that scheduled runs do, so a slow read-back can't hold up the next
+  Space change.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
   every 5 s, up to 12 tries, then wait for the next change. Under the lock: if
   `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else read the
@@ -495,8 +506,8 @@ not a guarantee: a busy lock, several displays or system load add to it.)
   start, or if the event loop ends without being asked to; launchd then restarts it
   after `ThrottleInterval`. If it is killed outright (SIGKILL), the kernel releases the
   lock and every state write is atomic, so that is safe too.
-- **Cost.** Idle: no measurable CPU; it wakes for a notification, a pending debounce or
-  retry timer, or a signal, and has no periodic wakeup; ~85 MB resident (Python
+- **Cost.** Idle: no measurable CPU; it wakes for a notification, a pending lock-retry
+  timer, or a signal, and has no periodic wakeup; ~85 MB resident (Python
   + AppKit; Pillow is imported only if a refresh has to render a new PNG, and then stays
   loaded).
 - **Interactions.** `--restore` puts the original back only until the next run, now

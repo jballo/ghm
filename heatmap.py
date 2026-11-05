@@ -644,8 +644,12 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
 
 
 def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: dict[str, Any],
-                    force: bool, theme: dict[str, Any]) -> None:
-    """Render (if needed) and set one screen's wallpaper, then record it; raise on failure."""
+                    force: bool, theme: dict[str, Any], settle: bool = True) -> None:
+    """Render (if needed) and set one screen's wallpaper, then record it; raise on failure.
+
+    settle=False skips the post-set read-back wait (the watcher, SPEC §13: it must not block
+    the next Space change for up to APPLY_WAIT_SECONDS, and no run follows it seconds later).
+    """
     key = str(display_id(screen))
     width, height = backing_size(screen)
     digest = render_hash(cells, width, height, theme)
@@ -666,6 +670,8 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
     state["applied"][key] = digest
     atomic_write_json(STATE_FILE, state)
     log.info("display %s: set %s (%dx%d)", key, png.name, width, height)
+    if not settle:
+        return
     # Give macOS a moment to report the new path, so a run seconds later sees it as up to date.
     # The set already succeeded and is recorded, so a failure here is only worth a log line.
     try:
@@ -675,7 +681,8 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
         log.warning("display %s: could not read the wallpaper back after setting it (%s)", key, exc)
 
 
-def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any]) -> int:
+def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any],
+                     settle: bool = True) -> int:
     """Update every screen that needs it; return EXIT_OK, EXIT_ERROR or EXIT_SKIPPED."""
     screens, workspace = screens_and_workspace()
     if not screens:
@@ -694,7 +701,7 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, 
     failed = False
     for index, screen in enumerate(screens):
         try:
-            apply_to_screen(workspace, screen, cells, state, force, theme)
+            apply_to_screen(workspace, screen, cells, state, force, theme, settle)
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True
@@ -830,7 +837,6 @@ def uninstall() -> int:
 
 # --- Space watcher (SPEC §13; opt-in, the only resident mode) -------------
 
-WATCH_DEBOUNCE_SECONDS = 1.0     # let a swipe across several Spaces settle before refreshing
 WATCH_RETRY_SECONDS = 5.0        # lock busy: try again this much later...
 WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wait for the next change
 REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
@@ -859,7 +865,7 @@ def refresh_from_cache() -> str:
             log.info("watch: no cached graph yet; the next scheduled run will set it")
             return REFRESH_DONE
         cells = validate_cells(state["cells"], dt.date.today())
-        apply_to_screens(cells, state, force=False, theme=theme)
+        apply_to_screens(cells, state, force=False, theme=theme, settle=False)
         return REFRESH_DONE
     except Exception as exc:  # noqa: BLE001 - logged; the watcher keeps running
         log.error("watch: refresh failed: %s: %s", type(exc).__name__, exc)
@@ -869,38 +875,42 @@ def refresh_from_cache() -> str:
             os.close(lock_fd)
 
 
-class SpaceChangeDebouncer:
-    """Turns a burst of Space-change notifications into one refresh, retrying while the lock is busy.
+class SpaceRefresher:
+    """Refreshes at once on each Space change; retries later while the lock is busy.
 
-    `schedule(delay, fn)` runs fn on the main thread after `delay` seconds; `refresh()` returns a
-    REFRESH_* value; `stop()` ends the event loop. Kept free of AppKit so it can be tested.
+    The refresh runs inside the notification callback, with no timer: macOS already reports
+    the new Space's wallpaper by then (measured on macOS 27.2), and a refresh whose PNG exists
+    takes a few ms, so waiting would only add delay. Changes that arrive during a refresh are
+    queued by the run loop and each get their own (cheap) refresh. A new change cancels a
+    pending retry. `schedule(delay, fn)` runs fn on the main thread after `delay` seconds;
+    `refresh()` returns a REFRESH_* value; `stop()` ends the event loop. Free of AppKit, so it
+    can be tested.
     """
 
     def __init__(self, schedule: Callable[[float, Callable[[], None]], None],
                  refresh: Callable[[], str], stop: Callable[[], None]) -> None:
         self.schedule, self.refresh, self.stop = schedule, refresh, stop
-        self.generation = 0      # bumped by every change; a callback from an older one does nothing
+        self.generation = 0      # bumped by every change; a retry from an older one does nothing
         self.attempts = 0
 
     def space_changed(self) -> None:
-        self.attempts = 0
-        self._arm(WATCH_DEBOUNCE_SECONDS)
-
-    def _arm(self, delay: float) -> None:
         self.generation += 1
-        generation = self.generation
-        self.schedule(delay, lambda: self._fire(generation))
+        self.attempts = 0
+        self._run()
 
-    def _fire(self, generation: int) -> None:
-        if generation != self.generation:
-            return  # superseded by a later change or retry
+    def _retry(self, generation: int) -> None:
+        if generation == self.generation:
+            self._run()
+
+    def _run(self) -> None:
         result = self.refresh()
         if result == REFRESH_STOP:
             self.stop()
         elif result == REFRESH_RETRY:
             self.attempts += 1
             if self.attempts < WATCH_RETRY_ATTEMPTS:
-                self._arm(WATCH_RETRY_SECONDS)
+                generation = self.generation
+                self.schedule(WATCH_RETRY_SECONDS, lambda: self._retry(generation))
             else:
                 log.warning("watch: lock stayed busy; waiting for the next Space change")
                 self.attempts = 0
@@ -947,11 +957,11 @@ def watch_spaces() -> int:
     # (a refresh in progress finishes first) and wakes the idle loop at once.
     for signum in (signal.SIGTERM, signal.SIGINT):
         MachSignals.signal(signum, lambda _signum: stop())
-    debouncer = SpaceChangeDebouncer(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
-                                     refresh=refresh_from_cache, stop=stop)
+    refresher = SpaceRefresher(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
+                               refresh=refresh_from_cache, stop=stop)
     center = NSWorkspace.sharedWorkspace().notificationCenter()
     token = center.addObserverForName_object_queue_usingBlock_(
-        NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: debouncer.space_changed())
+        NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: refresher.space_changed())
     log.info("watch: watching for Space changes (pid %d)", os.getpid())
     try:
         app.run()  # sleeps until a notification, timer, signal or event arrives
