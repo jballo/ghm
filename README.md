@@ -50,6 +50,9 @@ uv run heatmap.py --theme default               # back to green
 
 Names are case-insensitive. The choice is saved in `config.json`, so the scheduled runs
 keep it, and a reinstall keeps it unless you pass a different `--theme`.
+Only the desktop you are on changes at once. Other desktops (Spaces) switch the next
+time a run happens while you are on them; run `uv run heatmap.py` there to switch now
+(during a GitHub backoff it skips, like any other run).
 
 ## Other flags
 
@@ -76,8 +79,16 @@ Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edit
 ## Limitations
 
 - **Current Space only.** macOS has no public API to set the wallpaper on every
-  Space, so each screen's *current* Space is updated. Other Spaces keep their own
-  wallpaper.
+  Space, so each screen's *current* Space is updated. Other Spaces, and displays that
+  aren't connected, keep the heatmap they last showed. They catch up on the next
+  successful run while you are on them (normally within 10 minutes; a GitHub backoff,
+  sleep or a failed run can delay it), or at once if you run `uv run heatmap.py` there
+  (unless GitHub asked us to back off, or another run is in progress).
+  Recent PNGs (up to 50 rendered in the last 14 days, ~32 KB each) are kept so those
+  Spaces still have their file; one left alone longer may point at a deleted image
+  until a run happens on it.
+- **Uninstall restores the Spaces you are on.** Other Spaces can still point at a
+  deleted heatmap afterwards; open each one and pick a wallpaper in System Settings.
 - Restore is best-effort for static images. A dynamic wallpaper, a slideshow or a
   missing file can't be put back automatically, so the Wallpaper settings pane
   opens and you re-pick it there.

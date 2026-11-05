@@ -92,6 +92,11 @@ RESET_THEME = "default"                   # `--theme default` clears the saved t
 HEX_COLOUR_RE = re.compile(r"^#[0-9a-f]{6}$")
 FALLBACK_SIZE = (2880, 1800)              # dry-run size when no screen is available
 
+# Pruning (SPEC §6): besides the protected PNGs, keep up to RETAIN_EXTRA others rendered in
+# the last RETAIN_DAYS, so a Space you are not on rarely points at a deleted file (~32 KB each).
+RETAIN_DAYS = 14
+RETAIN_EXTRA = 50
+
 # macOS applies a wallpaper change asynchronously: desktopImageURLForScreen_ can keep
 # returning the OLD path for hundreds of ms after a successful set. We poll (SPEC §8).
 RESTORE_WAIT_SECONDS = 5.0                # after a restore, and before uninstall calls a display "ours"
@@ -585,21 +590,41 @@ def ensure_backup(workspace: Any, screens: list[Any], state: dict[str, Any]) -> 
     state["backup_not_needed"] = not entries and not added
 
 
-def pngs_to_prune(existing: list[Path], state: dict[str, Any], live_paths: list[str]) -> list[Path]:
-    """Return the PNGs that are not current, not previous, and not live on any screen.
+def pngs_to_prune(existing: list[tuple[Path, float | None]], state: dict[str, Any], live_paths: list[str],
+                  now: float) -> list[Path]:
+    """Return the PNGs to delete, given (path, mtime) pairs; mtime is None if it couldn't be read.
 
-    Paths are compared in both forms from path_forms(), on both sides: a symlinked alias
-    of a live PNG protects its target, and a live symlink in our dir protects itself.
+    Protected, never deleted and never counted against the cap: every PNG that is current or
+    previous for a display, and every one live on a screen. Paths are compared in both forms
+    from path_forms(), on both sides: a symlinked alias of a live PNG protects its target, and
+    a live symlink in our dir protects itself.
+
+    Of the rest, the RETAIN_EXTRA newest rendered within RETAIN_DAYS are kept too, because a
+    Space you are not on may still point at one (SPEC §6). A PNG whose mtime couldn't be read
+    is kept. Ties on mtime are broken by name, so the result doesn't depend on input order.
     """
     digests = list(state["applied"].values()) + list(state["applied_prev"].values())
-    keep: set[str] = set()
+    protected: set[str] = set()
     for path in [SUPPORT_DIR / f"heatmap-{digest}.png" for digest in digests] + list(live_paths):
-        keep |= path_forms(path)
-    return [png for png in existing if not (path_forms(png) & keep)]
+        protected |= path_forms(path)
+    others = [(png, mtime) for png, mtime in existing if not (path_forms(png) & protected)]
+    cutoff = now - RETAIN_DAYS * 86400
+    recent = sorted(((png, mtime) for png, mtime in others if mtime is not None and mtime >= cutoff),
+                    key=lambda item: (-item[1], item[0].name))
+    retained = {png for png, _mtime in recent[:RETAIN_EXTRA]}
+    return [png for png, mtime in others if mtime is not None and png not in retained]
+
+
+def png_mtime(png: Path) -> float | None:
+    """The PNG's own modification time (symlinks not followed), or None if it can't be read."""
+    try:
+        return os.lstat(png).st_mtime
+    except OSError:
+        return None
 
 
 def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
-    """Delete unneeded heatmap-*.png files; skip entirely if the screens can't be read."""
+    """Delete unneeded heatmap-*.png files (see pngs_to_prune); skip if the screens can't be read."""
     if live_before is None:
         log.warning("could not read wallpapers before this run; not pruning")
         return
@@ -610,7 +635,8 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
         log.warning("could not read current wallpapers (%s); not pruning", exc)
         return
     live = [p for p in live_before + live_now if p]
-    for png in pngs_to_prune(sorted(SUPPORT_DIR.glob("heatmap-*.png")), state, live):
+    existing = [(png, png_mtime(png)) for png in sorted(SUPPORT_DIR.glob("heatmap-*.png"))]
+    for png in pngs_to_prune(existing, state, live, time.time()):
         png.unlink(missing_ok=True)
         log.info("pruned %s", png.name)
 
