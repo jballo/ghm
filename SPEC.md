@@ -523,3 +523,11 @@ lock, several displays or system load can add delay.
   swipe. macOS keeps showing the image it already loaded. So with public API the
   arrival flash can't be avoided, and content-addressed file names stay. (In-place
   rewriting was not tried: a reader could see a half-written PNG, so it couldn't ship.)
+- **Tried and rejected: "Show on all Spaces" and a folder slideshow** (macOS 27.2, System
+  Settings > Wallpaper). With "Show on all Spaces" on, our `setDesktopImageURL…` call
+  turns it back off; observed once, that call still reached every Space before the switch
+  went off, so turning it on and running `heatmap.py --force` may bring every desktop up
+  to date at once, but the next update is per-Space again (no public API keeps it on).
+  macOS 27 has no folder slideshow: a picked folder's images join the "Your Photos"
+  collection, and "Shuffle" rotates through that whole collection (old wallpapers
+  included), not a folder the tool could keep current. So neither replaces the watcher.

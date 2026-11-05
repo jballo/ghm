@@ -96,6 +96,8 @@ Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edit
   arrived. Spaces you don't visit still keep their old image.
   Turn it off with `install.py --user YOUR_GITHUB_NAME --no-watch-spaces`; a reinstall
   without either flag keeps your choice.
+- **"Show on all Spaces" gets turned off.** macOS switches that Wallpaper setting off
+  whenever an app sets the wallpaper, so each update applies per Space (see SPEC §13).
 - **Uninstall restores the Spaces you are on.** Other Spaces can still point at a
   deleted heatmap afterwards; open each one and pick a wallpaper in System Settings.
 - Restore is best-effort for static images. A dynamic wallpaper, a slideshow or a
