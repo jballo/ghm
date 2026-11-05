@@ -150,6 +150,14 @@ def build_watch_plist() -> dict:
     }
 
 
+def remove_watcher(domain: str) -> None:
+    """Stop the Space watcher (ignore failure: it may not be loaded) and delete its plist."""
+    subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+    if WATCH_PLIST_PATH.exists():
+        WATCH_PLIST_PATH.unlink()
+        print(f"==> stopped {WATCH_LABEL} and removed {WATCH_PLIST_PATH}")
+
+
 def main() -> int:
     """Run the install steps in order; stop at the first failure."""
     parser = argparse.ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
@@ -174,6 +182,12 @@ def main() -> int:
     uv = shutil.which("uv")
     if uv is None:
         sys.exit("uv not found on PATH; install it first (https://docs.astral.sh/uv/)")
+
+    # 1a. --no-watch-spaces is honoured first, so turning the watcher off never depends on
+    #     the steps below (uv sync, the first run, GitHub, the main agent) succeeding.
+    domain = f"gui/{os.getuid()}"
+    if args.watch_spaces is False:
+        remove_watcher(domain)
 
     # 2. Install exactly the hash-pinned wheels from uv.lock. --locked fails if uv.lock is
     #    missing or out of date with pyproject.toml (--frozen would silently accept a stale lock).
@@ -216,28 +230,28 @@ def main() -> int:
     print(f"==> wrote {PLIST_PATH}")
 
     # 6. (Re)load it: bootout may fail if it was not loaded, which is fine.
-    domain = f"gui/{os.getuid()}"
     subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{LABEL}"], check=False, capture_output=True)
     subprocess.run([LAUNCHCTL, "bootstrap", domain, str(PLIST_PATH)], check=True)
 
-    # 6a. The opt-in Space watcher: on with --watch-spaces, off with --no-watch-spaces,
-    #     otherwise as a previous install left it (its plist exists or not).
+    # 6a. The opt-in Space watcher: on with --watch-spaces; with no flag, as a previous
+    #     install left it (its plist exists or not); --no-watch-spaces was handled in 1a.
     watch = WATCH_PLIST_PATH.exists() if args.watch_spaces is None else args.watch_spaces
-    subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
     if watch:
+        subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
         atomic_write_bytes(WATCH_PLIST_PATH, plistlib.dumps(build_watch_plist()))
-        subprocess.run([LAUNCHCTL, "bootstrap", domain, str(WATCH_PLIST_PATH)], check=True)
+        loaded = subprocess.run([LAUNCHCTL, "bootstrap", domain, str(WATCH_PLIST_PATH)], check=False)
+        if loaded.returncode != 0:
+            WATCH_PLIST_PATH.unlink(missing_ok=True)
+            sys.exit(f"{LABEL} is installed, but loading {WATCH_LABEL} failed "
+                     f"(launchctl exit {loaded.returncode}); the Space watcher is not installed")
         print(f"==> wrote and loaded {WATCH_PLIST_PATH}")
-    elif WATCH_PLIST_PATH.exists():
-        WATCH_PLIST_PATH.unlink()
-        print(f"==> removed {WATCH_PLIST_PATH}")
 
     # 7. Report.
     print(f"\nInstalled {LABEL}: runs every {args.interval} s for GitHub user {args.user} "
           f"(theme: {theme or RESET_THEME}).")
     if watch:
         print(f"Installed {WATCH_LABEL}: re-applies the graph when you switch Spaces "
-              "(turn off: install.py --no-watch-spaces).")
+              f"(turn off: python3 install.py --user {args.user} --no-watch-spaces).")
     print(f"  theme:     cd {PROJECT_DIR} && uv run heatmap.py --theme NAME   (--list-themes for names)")
     print(f"  check:     launchctl print {domain}/{LABEL}")
     print("  log:       ~/Library/Logs/gh-heatmap.log")

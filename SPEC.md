@@ -289,7 +289,7 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   run can delay that. A successful run by hand updates the current Space at once (the
   same backoff and lock rules apply, also with `--force`).
   Retention in §6 step 5 keeps the PNGs those Spaces point at for a while, and the
-  opt-in Space watcher (§13) updates a Space within about a second of switching to it.
+  opt-in Space watcher (§13) updates a Space shortly after you switch to it.
 
 ## 9. Backup and restore
 
@@ -366,11 +366,14 @@ install.py --user NAME [--theme NAME] [--interval 600] [--watch-spaces | --no-wa
    No `KeepAlive` (the script exits on purpose; no restart loops).
 6. `launchctl bootout gui/$UID/local.gh-heatmap` (ignore failure), then
    `launchctl bootstrap gui/$UID <plist>` with `check=True`.
-6a. Space watcher (§13): on with `--watch-spaces`, off with `--no-watch-spaces`; with
-   neither, keep what a previous install chose (its plist exists or not). Always
-   `bootout gui/$UID/local.gh-heatmap.spaces` (ignore failure); then, if on, write
-   `~/Library/LaunchAgents/local.gh-heatmap.spaces.plist` and `bootstrap` it
-   (`check=True`); if off, delete that plist if present.
+6a. Space watcher (§13): on with `--watch-spaces`; with no flag, keep what a previous
+   install chose (its plist exists or not). If on: `bootout
+   gui/$UID/local.gh-heatmap.spaces` (ignore failure), write
+   `~/Library/LaunchAgents/local.gh-heatmap.spaces.plist`, `bootstrap` it; if that
+   bootstrap fails, delete the plist and exit 1 saying the main agent is installed but
+   the watcher is not. `--no-watch-spaces` is not handled here but right after step 1
+   (bootout, delete the plist), before `uv sync`, so turning the watcher off never
+   depends on the first run or GitHub.
 7. Print what was installed and how to uninstall.
 
 ## 11. `uninstall.py`
@@ -439,7 +442,7 @@ restore, so a later run deletes whatever remains.
     change nothing.
 4b. `install.py --user jballo --watch-spaces` → `launchctl print gui/$UID/local.gh-heatmap.spaces`
     shows it running; log says `watch: watching for Space changes`. With 2+ desktops:
-    `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there within about a
+    `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there after about a
     second, and the log shows no fetch for it. Switch with the network off → still updates.
     `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
@@ -448,8 +451,9 @@ restore, so a later run deletes whatever remains.
 
 macOS has no public API to set every Space's wallpaper, but it does announce, through
 public AppKit API, when the active Space changes. The watcher listens for that and
-re-applies the graph, so the Space you switch to is updated within about a second
-instead of at the next scheduled run.
+re-applies the graph, so the Space you switch to is usually updated about a second
+after you stop switching, instead of at the next scheduled run. (The 1 s is a debounce,
+not a guarantee: a busy lock, several displays or system load add to it.)
 
 - **Opt-in.** `install.py --watch-spaces` (§10 step 6a). The default install has no
   resident process (§1).
@@ -459,14 +463,15 @@ instead of at the next scheduled run.
   WorkingDirectory   <abs project dir>
   EnvironmentVariables {"PATH": "/usr/bin:/bin"}
   RunAtLoad          true
-  KeepAlive          {SuccessfulExit: false}   (restarted only if it crashes)
+  KeepAlive          {SuccessfulExit: false}   (restarted if it exits non-zero or crashes)
   ThrottleInterval   60                        (at most one restart a minute)
   StandardOutPath / StandardErrorPath  ~/Library/Logs/gh-heatmap.launchd.log
   ```
 - **How.** `NSApplication.sharedApplication()` with activation policy *prohibited* (no
   Dock icon or menu bar), an observer for `NSWorkspaceActiveSpaceDidChangeNotification`
   on `NSWorkspace.sharedWorkspace().notificationCenter()`, then
-  `PyObjCTools.AppHelper.runConsoleEventLoop`. Nothing else is observed.
+  `PyObjCTools.AppHelper.runConsoleEventLoop` with `maxTimeout` 3600 s (PyObjC's default
+  of 3 s would wake the idle loop every 3 s). Nothing else is observed.
 - **Debounce.** Each notification (re)arms a 1 s timer; only the last one in a burst runs
   a refresh, so swiping across several Spaces does one refresh.
 - **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
@@ -477,11 +482,18 @@ instead of at the next scheduled run.
   makes no network request and is unaffected by a GitHub backoff; the scheduled run keeps
   the cache fresh. No cached cells yet: log and do nothing. Any error is logged and the
   watcher keeps running.
-- **Exit.** 0 when stopped or when not installed at start (no `config.json`); 1 on an
-  unexpected startup error (launchd restarts it after `ThrottleInterval`).
-  `launchctl bootout` stops it with SIGTERM; the lock is released by the kernel and every
-  state write is atomic, so being killed mid-refresh is safe.
-- **Cost.** Idle: no CPU and no wakeups beyond the notification; ~60 MB resident (Python
+- **Errors.** Unlike a scheduled run (§1 "Fail safe": log and exit), the watcher logs a
+  failed refresh, including a lock error, and keeps running; the next Space change
+  tries again.
+- **Exit.** 0 when not installed (no `config.json`, at start or at a refresh) or when
+  stopped by SIGTERM (`launchctl bootout`) or SIGINT. Those signals are routed through
+  PyObjC's `MachSignals` to the run loop, so a refresh in progress finishes first, then
+  the observer is removed and `watch: stopped` is logged. 1 on an unexpected error at
+  start, or if the event loop ends without being asked to; launchd then restarts it
+  after `ThrottleInterval`. If it is killed outright (SIGKILL), the kernel releases the
+  lock and every state write is atomic, so that is safe too.
+- **Cost.** Idle: no measurable CPU; it wakes for a notification, a pending debounce or
+  retry timer, a signal, and at most once an hour otherwise; ~60 MB resident (Python
   + AppKit; Pillow is imported only if a refresh has to render a new PNG, and then stays
   loaded).
 - **Interactions.** `--restore` puts the original back only until the next run, now

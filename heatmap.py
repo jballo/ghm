@@ -833,6 +833,7 @@ def uninstall() -> int:
 WATCH_DEBOUNCE_SECONDS = 1.0     # let a swipe across several Spaces settle before refreshing
 WATCH_RETRY_SECONDS = 5.0        # lock busy: try again this much later...
 WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wait for the next change
+WATCH_IDLE_WAKE_SECONDS = 3600.0  # longest the idle event loop sleeps before re-checking
 REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
 
 
@@ -841,12 +842,13 @@ def refresh_from_cache() -> str:
 
     Takes the lock for the duration. Returns REFRESH_RETRY if another run holds it,
     REFRESH_STOP if config.json is gone (uninstalled), else REFRESH_DONE. Errors are logged,
-    never raised, so one bad refresh can't stop the watcher.
+    never raised (lock errors included), so one bad refresh can't stop the watcher.
     """
-    lock_fd = acquire_lock()
-    if lock_fd is None:
-        return REFRESH_RETRY
+    lock_fd = None
     try:
+        lock_fd = acquire_lock()
+        if lock_fd is None:
+            return REFRESH_RETRY
         config = load_config()
         if config is None:
             log.info("watch: config.json is gone (uninstalled?); stopping")
@@ -864,7 +866,8 @@ def refresh_from_cache() -> str:
         log.error("watch: refresh failed: %s: %s", type(exc).__name__, exc)
         return REFRESH_DONE
     finally:
-        os.close(lock_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 class SpaceChangeDebouncer:
@@ -910,29 +913,48 @@ def watch_spaces() -> int:
     """Stay resident; after each active-Space change, refresh from cache (SPEC §13).
 
     Uses only public AppKit API: NSWorkspace's NSWorkspaceActiveSpaceDidChangeNotification.
-    Exits 0 when not installed (no config.json), so launchd's KeepAlive {SuccessfulExit: false}
-    does not restart it; launchctl bootout stops it with SIGTERM.
+    Exits 0 when not installed (no config.json) or when asked to stop (SIGTERM from launchctl
+    bootout, SIGINT), so launchd's KeepAlive {SuccessfulExit: false} does not restart it.
+    Exits 1 if the event loop ends on its own, so launchd does restart it.
     """
     if load_config() is None:
         log.info("watch: not installed (no config.json); exiting")
         return EXIT_OK
     from AppKit import (NSApplication, NSApplicationActivationPolicyProhibited, NSWorkspace,
                         NSWorkspaceActiveSpaceDidChangeNotification)
-    from PyObjCTools import AppHelper
+    import signal
+
+    from PyObjCTools import AppHelper, MachSignals
 
     # A connection to the app machinery, with no Dock icon or menu bar, so that NSWorkspace
     # delivers its notifications to this non-bundled process.
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+    stopping = False
+
+    def stop() -> None:
+        nonlocal stopping
+        stopping = True
+        AppHelper.stopEventLoop()
+
+    # Delivered through a mach port on the run loop, so the handler runs between refreshes
+    # (a refresh in progress finishes first) and wakes the idle loop at once.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        MachSignals.signal(signum, lambda _signum: stop())
     debouncer = SpaceChangeDebouncer(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
-                                     refresh=refresh_from_cache, stop=AppHelper.stopEventLoop)
+                                     refresh=refresh_from_cache, stop=stop)
     center = NSWorkspace.sharedWorkspace().notificationCenter()
     token = center.addObserverForName_object_queue_usingBlock_(
         NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: debouncer.space_changed())
     log.info("watch: watching for Space changes (pid %d)", os.getpid())
     try:
-        AppHelper.runConsoleEventLoop(installInterrupt=True)
+        # The default maxTimeout (3 s) would wake the idle loop every 3 s; signals, timers and
+        # notifications all wake it themselves, so an hourly cap is only a safety net.
+        AppHelper.runConsoleEventLoop(maxTimeout=WATCH_IDLE_WAKE_SECONDS)
     finally:
         center.removeObserver_(token)
+    if not stopping:
+        log.error("watch: event loop ended unexpectedly; exiting so launchd restarts it")
+        return EXIT_ERROR
     log.info("watch: stopped")
     return EXIT_OK
 
