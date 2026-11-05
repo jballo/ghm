@@ -5,7 +5,8 @@ by default, or one of five built-in themes (§7), refreshed every 10 minutes by 
 launchd job. Written in
 Python so the owner can audit every line.
 
-Non-goals for v1: multiple Spaces, headline text, custom (user-defined) themes, Linux, a resident daemon.
+Non-goals for v1: setting every Space at once (no public API; §8), headline text, custom
+(user-defined) themes, Linux, a resident daemon by default (the Space watcher in §13 is opt-in).
 
 ## 1. Principles
 
@@ -15,8 +16,13 @@ Non-goals for v1: multiple Spaces, headline text, custom (user-defined) themes, 
   inside `install.py`/`uninstall.py`.
 - **No secrets.** No GitHub token. Reads only the public page
   `https://github.com/users/<username>/contributions`.
-- **No resident process.** Each run: fetch → parse → render → set wallpaper → exit.
-  launchd starts it every 10 minutes. Most runs do no work (see §5).
+- **No resident process by default.** Each run: fetch → parse → render → set wallpaper → exit.
+  launchd starts it every 10 minutes. Most runs do no work (see §5). The one exception is
+  the opt-in Space watcher (§13): a small process that waits for a public AppKit
+  notification and makes no network requests.
+- **Public API only.** Wallpapers are read and set only through documented AppKit /
+  Foundation calls; no private frameworks and no reading or writing Apple's own
+  wallpaper or Spaces files.
 - **Fail safe.** Any error leaves the current wallpaper untouched, logs one line,
   and exits. Never draw an empty graph on bad data.
 - **Everything under `$HOME`.** No sudo, no system files, no shell-rc edits.
@@ -55,6 +61,7 @@ Runtime files (all created by `heatmap.py`):
 ~/Library/Logs/gh-heatmap.log          RotatingFileHandler, 512 KiB × 3
 ~/Library/Logs/gh-heatmap.launchd.log  launchd stdout/stderr (should stay empty)
 ~/Library/LaunchAgents/local.gh-heatmap.plist
+~/Library/LaunchAgents/local.gh-heatmap.spaces.plist   only with install.py --watch-spaces (§13)
 ```
 
 ## 3. `heatmap.py` CLI
@@ -76,13 +83,16 @@ heatmap.py --force         ignore ETag and up-to-date checks; re-render and re-a
 heatmap.py --restore       restore the wallpaper(s) saved in backup.json; deletes nothing
 heatmap.py --uninstall     restore, verify no screen shows our image, then delete all our
                            files, all under one lock (used by uninstall.py; §11)
+heatmap.py --watch-spaces  stay running; after each active-Space change, re-apply the cached
+                           graph (§13). No other options allowed. What the opt-in watcher
+                           agent runs
 ```
 
 Exit codes:
 
 | code | meaning |
 |------|---------|
-| 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything; `--list-themes` |
+| 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything; `--list-themes`; `--watch-spaces` stopped, or found nothing installed |
 | 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme (given or saved); `--theme` with no config.json; any usage error (argparse is made to exit 1, because 2 means "skipped") |
 | 2 | skipped gracefully (scheduled run): no screens, inside a GitHub backoff window, or the lock is busy |
 | 3 | `--restore` / `--uninstall` only: the lock is busy (uninstall.py waits and retries) |
@@ -278,7 +288,8 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
   while you are on that Space, but a GitHub backoff, sleep, a busy lock or a failed
   run can delay that. A successful run by hand updates the current Space at once (the
   same backoff and lock rules apply, also with `--force`).
-  Retention in §6 step 5 keeps the PNGs those Spaces point at for a while.
+  Retention in §6 step 5 keeps the PNGs those Spaces point at for a while, and the
+  opt-in Space watcher (§13) updates a Space within about a second of switching to it.
 
 ## 9. Backup and restore
 
@@ -318,7 +329,7 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
 ## 10. `install.py`
 
 ```
-install.py --user NAME [--theme NAME] [--interval 600]
+install.py --user NAME [--theme NAME] [--interval 600] [--watch-spaces | --no-watch-spaces]
 ```
 
 1. Validate username (same regex) and `--theme` (case-insensitive; one of
@@ -355,6 +366,11 @@ install.py --user NAME [--theme NAME] [--interval 600]
    No `KeepAlive` (the script exits on purpose; no restart loops).
 6. `launchctl bootout gui/$UID/local.gh-heatmap` (ignore failure), then
    `launchctl bootstrap gui/$UID <plist>` with `check=True`.
+6a. Space watcher (§13): on with `--watch-spaces`, off with `--no-watch-spaces`; with
+   neither, keep what a previous install chose (its plist exists or not). Always
+   `bootout gui/$UID/local.gh-heatmap.spaces` (ignore failure); then, if on, write
+   `~/Library/LaunchAgents/local.gh-heatmap.spaces.plist` and `bootstrap` it
+   (`check=True`); if off, delete that plist if present.
 7. Print what was installed and how to uninstall.
 
 ## 11. `uninstall.py`
@@ -365,8 +381,10 @@ deletes the support dir or logs itself.
 
 `uninstall.py`:
 
-1. `launchctl bootout gui/$UID/local.gh-heatmap` (ignore failure).
-2. Delete the plist. Steps 1–2 always happen, so nothing is scheduled again.
+1. `launchctl bootout gui/$UID/local.gh-heatmap` and `gui/$UID/local.gh-heatmap.spaces`
+   (ignore failures). The watcher must be stopped before restoring, or a Space switch
+   would put the heatmap back.
+2. Delete both plists. Steps 1–2 always happen, so nothing runs again.
 3. If `.venv/bin/python` is missing: say that the wallpaper can't be restored or verified
    safely, print the original paths from `backup.json` (plain JSON read), tell the user
    to run `uv sync --locked` and then uninstall.py again, and exit 1 with everything else
@@ -419,4 +437,55 @@ restore, so a later run deletes whatever remains.
     `heatmap.py --theme default` → green, `"theme"` gone. Reinstall without `--theme` keeps
     the saved theme. `install.py --theme bogus` and `heatmap.py --theme bogus` exit 1 and
     change nothing.
+4b. `install.py --user jballo --watch-spaces` → `launchctl print gui/$UID/local.gh-heatmap.spaces`
+    shows it running; log says `watch: watching for Space changes`. With 2+ desktops:
+    `heatmap.py --theme nord` on desktop 1, swipe to desktop 2 → Nord there within about a
+    second, and the log shows no fetch for it. Switch with the network off → still updates.
+    `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
+
+## 13. Space watcher (opt-in)
+
+macOS has no public API to set every Space's wallpaper, but it does announce, through
+public AppKit API, when the active Space changes. The watcher listens for that and
+re-applies the graph, so the Space you switch to is updated within about a second
+instead of at the next scheduled run.
+
+- **Opt-in.** `install.py --watch-spaces` (§10 step 6a). The default install has no
+  resident process (§1).
+- **What runs.** LaunchAgent `local.gh-heatmap.spaces`:
+  ```
+  ProgramArguments   [<abs .venv/bin/python>, <abs heatmap.py>, --watch-spaces]
+  WorkingDirectory   <abs project dir>
+  EnvironmentVariables {"PATH": "/usr/bin:/bin"}
+  RunAtLoad          true
+  KeepAlive          {SuccessfulExit: false}   (restarted only if it crashes)
+  ThrottleInterval   60                        (at most one restart a minute)
+  StandardOutPath / StandardErrorPath  ~/Library/Logs/gh-heatmap.launchd.log
+  ```
+- **How.** `NSApplication.sharedApplication()` with activation policy *prohibited* (no
+  Dock icon or menu bar), an observer for `NSWorkspaceActiveSpaceDidChangeNotification`
+  on `NSWorkspace.sharedWorkspace().notificationCenter()`, then
+  `PyObjCTools.AppHelper.runConsoleEventLoop`. Nothing else is observed.
+- **Debounce.** Each notification (re)arms a 1 s timer; only the last one in a burst runs
+  a refresh, so swiping across several Spaces does one refresh.
+- **Refresh** (`refresh_from_cache`): take the lock non-blocking (§6). If busy, retry
+  every 5 s, up to 12 tries, then wait for the next change. Under the lock: if
+  `config.json` is gone, stop and exit 0 (so launchd doesn't restart it); else read the
+  username and theme from it, load `state.json`, and if it has cached cells, run the
+  normal per-display apply and prune (§6 steps 1–5) with them. It **never fetches**, so it
+  makes no network request and is unaffected by a GitHub backoff; the scheduled run keeps
+  the cache fresh. No cached cells yet: log and do nothing. Any error is logged and the
+  watcher keeps running.
+- **Exit.** 0 when stopped or when not installed at start (no `config.json`); 1 on an
+  unexpected startup error (launchd restarts it after `ThrottleInterval`).
+  `launchctl bootout` stops it with SIGTERM; the lock is released by the kernel and every
+  state write is atomic, so being killed mid-refresh is safe.
+- **Cost.** Idle: no CPU and no wakeups beyond the notification; ~60 MB resident (Python
+  + AppKit; Pillow is imported only if a refresh has to render a new PNG, and then stays
+  loaded).
+- **Interactions.** `--restore` puts the original back only until the next run, now
+  including the next Space switch; uninstall stops the watcher first (§11). Setting a
+  wallpaper does not change the active Space, so a refresh can't trigger itself.
+- **Limits.** It updates the Space you switch *to*. Spaces you don't visit, and displays
+  that aren't connected, still keep their old image (§6 step 5 retention still applies).

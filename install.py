@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Install gh-heatmap for the current user (SPEC §10).
 
-Usage: python3 install.py --user NAME [--theme NAME] [--interval 600]
+Usage: python3 install.py --user NAME [--theme NAME] [--interval 600] [--watch-spaces | --no-watch-spaces]
 
 Runs `uv sync --locked`, writes config.json (keeping a saved theme unless --theme is given),
 does one run by hand (which must succeed
-and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. Everything lives under $HOME; no sudo. Uses only the
+and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. With --watch-spaces it
+also loads a second, resident agent that re-applies the graph when you switch Spaces (SPEC §13).
+Everything lives under $HOME; no sudo. Uses only the
 standard library so it runs on any Python 3.9+ (including macOS's /usr/bin/python3).
 """
 
@@ -38,6 +40,8 @@ STATE_FILE = SUPPORT_DIR / "state.json"
 BACKUP_FILE = SUPPORT_DIR / "backup.json"
 LOCK_FILE = SUPPORT_DIR.parent / "gh-heatmap.lock"   # heatmap.py's lock; outside SUPPORT_DIR
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+WATCH_LABEL = "local.gh-heatmap.spaces"   # opt-in Space watcher (SPEC §13); uninstall.py matches
+WATCH_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{WATCH_LABEL}.plist"
 LAUNCHD_LOG = Path.home() / "Library" / "Logs" / "gh-heatmap.launchd.log"
 LAUNCHCTL = "/bin/launchctl"
 LOCK_ATTEMPTS = 15   # ...retried every LOCK_RETRY_SECONDS, about 30 s in total (as uninstall.py)
@@ -130,6 +134,22 @@ def build_plist(interval: int) -> dict:
     }
 
 
+def build_watch_plist() -> dict:
+    """The opt-in Space watcher: resident, restarted by launchd only if it crashes."""
+    return {
+        "Label": WATCH_LABEL,
+        "ProgramArguments": [str(VENV_PYTHON), str(HEATMAP), "--watch-spaces"],
+        "WorkingDirectory": str(PROJECT_DIR),
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin"},
+        "RunAtLoad": True,
+        # It exits 0 on purpose when uninstalled (no config.json): don't restart that.
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,   # at most one restart a minute if it keeps crashing
+        "StandardOutPath": str(LAUNCHD_LOG),
+        "StandardErrorPath": str(LAUNCHD_LOG),
+    }
+
+
 def main() -> int:
     """Run the install steps in order; stop at the first failure."""
     parser = argparse.ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
@@ -138,6 +158,9 @@ def main() -> int:
                         help=f"colour theme: {', '.join(THEME_NAMES)}, or {RESET_THEME} (the green look). "
                              "Omitted: keep the saved theme on a reinstall, else default")
     parser.add_argument("--interval", type=int, default=600, help="seconds between runs (default 600)")
+    parser.add_argument("--watch-spaces", action=argparse.BooleanOptionalAction, default=None,
+                        help="also run a small resident process that re-applies the graph when you "
+                             "switch Spaces (SPEC §13). Omitted: keep whatever a previous install chose")
     args = parser.parse_args()
 
     # 1. Validate inputs and find uv.
@@ -197,9 +220,24 @@ def main() -> int:
     subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{LABEL}"], check=False, capture_output=True)
     subprocess.run([LAUNCHCTL, "bootstrap", domain, str(PLIST_PATH)], check=True)
 
+    # 6a. The opt-in Space watcher: on with --watch-spaces, off with --no-watch-spaces,
+    #     otherwise as a previous install left it (its plist exists or not).
+    watch = WATCH_PLIST_PATH.exists() if args.watch_spaces is None else args.watch_spaces
+    subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+    if watch:
+        atomic_write_bytes(WATCH_PLIST_PATH, plistlib.dumps(build_watch_plist()))
+        subprocess.run([LAUNCHCTL, "bootstrap", domain, str(WATCH_PLIST_PATH)], check=True)
+        print(f"==> wrote and loaded {WATCH_PLIST_PATH}")
+    elif WATCH_PLIST_PATH.exists():
+        WATCH_PLIST_PATH.unlink()
+        print(f"==> removed {WATCH_PLIST_PATH}")
+
     # 7. Report.
     print(f"\nInstalled {LABEL}: runs every {args.interval} s for GitHub user {args.user} "
           f"(theme: {theme or RESET_THEME}).")
+    if watch:
+        print(f"Installed {WATCH_LABEL}: re-applies the graph when you switch Spaces "
+              "(turn off: install.py --no-watch-spaces).")
     print(f"  theme:     cd {PROJECT_DIR} && uv run heatmap.py --theme NAME   (--list-themes for names)")
     print(f"  check:     launchctl print {domain}/{LABEL}")
     print("  log:       ~/Library/Logs/gh-heatmap.log")

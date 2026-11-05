@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """gh-heatmap: your public GitHub contribution graph as your macOS wallpaper (see SPEC.md).
 
-Each run: fetch -> parse -> render -> set wallpaper -> exit. Only the standard library is
+Each run: fetch -> parse -> render -> set wallpaper -> exit. The one exception is the opt-in
+`--watch-spaces` mode (SPEC §13), which stays running and re-applies cached data whenever the
+active Space changes, without any network request. Only the standard library is
 imported at module level; Pillow and AppKit/Foundation are imported inside the functions
 that need them, so `--restore` and `--uninstall` never import Pillow.
 
@@ -12,7 +14,7 @@ and the check then passes.
 
 Exit codes (SPEC §3):
   0  success: applied or already up to date on every screen; --restore restored everything;
-     --uninstall deleted everything
+     --uninstall deleted everything; --watch-spaces stopped, or found nothing installed
   1  error, including: --dry-run wrote no preview; --restore could not restore every screen;
      --uninstall kept the files because a screen still shows our image; an unknown theme;
      any command-line usage error
@@ -826,6 +828,115 @@ def uninstall() -> int:
     return EXIT_OK
 
 
+# --- Space watcher (SPEC §13; opt-in, the only resident mode) -------------
+
+WATCH_DEBOUNCE_SECONDS = 1.0     # let a swipe across several Spaces settle before refreshing
+WATCH_RETRY_SECONDS = 5.0        # lock busy: try again this much later...
+WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wait for the next change
+REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
+
+
+def refresh_from_cache() -> str:
+    """Re-apply the cached graph to every screen's current Space; never makes a network request.
+
+    Takes the lock for the duration. Returns REFRESH_RETRY if another run holds it,
+    REFRESH_STOP if config.json is gone (uninstalled), else REFRESH_DONE. Errors are logged,
+    never raised, so one bad refresh can't stop the watcher.
+    """
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        return REFRESH_RETRY
+    try:
+        config = load_config()
+        if config is None:
+            log.info("watch: config.json is gone (uninstalled?); stopping")
+            return REFRESH_STOP
+        username = resolve_username(None, config)
+        theme = resolve_theme(saved_theme_name(config))
+        state = load_state(username)
+        if not state.get("cells"):
+            log.info("watch: no cached graph yet; the next scheduled run will set it")
+            return REFRESH_DONE
+        cells = validate_cells(state["cells"], dt.date.today())
+        apply_to_screens(cells, state, force=False, theme=theme)
+        return REFRESH_DONE
+    except Exception as exc:  # noqa: BLE001 - logged; the watcher keeps running
+        log.error("watch: refresh failed: %s: %s", type(exc).__name__, exc)
+        return REFRESH_DONE
+    finally:
+        os.close(lock_fd)
+
+
+class SpaceChangeDebouncer:
+    """Turns a burst of Space-change notifications into one refresh, retrying while the lock is busy.
+
+    `schedule(delay, fn)` runs fn on the main thread after `delay` seconds; `refresh()` returns a
+    REFRESH_* value; `stop()` ends the event loop. Kept free of AppKit so it can be tested.
+    """
+
+    def __init__(self, schedule: Callable[[float, Callable[[], None]], None],
+                 refresh: Callable[[], str], stop: Callable[[], None]) -> None:
+        self.schedule, self.refresh, self.stop = schedule, refresh, stop
+        self.generation = 0      # bumped by every change; a callback from an older one does nothing
+        self.attempts = 0
+
+    def space_changed(self) -> None:
+        self.attempts = 0
+        self._arm(WATCH_DEBOUNCE_SECONDS)
+
+    def _arm(self, delay: float) -> None:
+        self.generation += 1
+        generation = self.generation
+        self.schedule(delay, lambda: self._fire(generation))
+
+    def _fire(self, generation: int) -> None:
+        if generation != self.generation:
+            return  # superseded by a later change or retry
+        result = self.refresh()
+        if result == REFRESH_STOP:
+            self.stop()
+        elif result == REFRESH_RETRY:
+            self.attempts += 1
+            if self.attempts < WATCH_RETRY_ATTEMPTS:
+                self._arm(WATCH_RETRY_SECONDS)
+            else:
+                log.warning("watch: lock stayed busy; waiting for the next Space change")
+                self.attempts = 0
+        else:
+            self.attempts = 0
+
+
+def watch_spaces() -> int:
+    """Stay resident; after each active-Space change, refresh from cache (SPEC §13).
+
+    Uses only public AppKit API: NSWorkspace's NSWorkspaceActiveSpaceDidChangeNotification.
+    Exits 0 when not installed (no config.json), so launchd's KeepAlive {SuccessfulExit: false}
+    does not restart it; launchctl bootout stops it with SIGTERM.
+    """
+    if load_config() is None:
+        log.info("watch: not installed (no config.json); exiting")
+        return EXIT_OK
+    from AppKit import (NSApplication, NSApplicationActivationPolicyProhibited, NSWorkspace,
+                        NSWorkspaceActiveSpaceDidChangeNotification)
+    from PyObjCTools import AppHelper
+
+    # A connection to the app machinery, with no Dock icon or menu bar, so that NSWorkspace
+    # delivers its notifications to this non-bundled process.
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+    debouncer = SpaceChangeDebouncer(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
+                                     refresh=refresh_from_cache, stop=AppHelper.stopEventLoop)
+    center = NSWorkspace.sharedWorkspace().notificationCenter()
+    token = center.addObserverForName_object_queue_usingBlock_(
+        NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: debouncer.space_changed())
+    log.info("watch: watching for Space changes (pid %d)", os.getpid())
+    try:
+        AppHelper.runConsoleEventLoop(installInterrupt=True)
+    finally:
+        center.removeObserver_(token)
+    log.info("watch: stopped")
+    return EXIT_OK
+
+
 # --- Entry points (SPEC §3) ------------------------------------------------
 
 def load_config() -> dict[str, Any] | None:
@@ -919,6 +1030,8 @@ def run(args: argparse.Namespace) -> int:
     if args.dry_run:  # writes only preview.png (and the log), so no lock is needed; saves nothing
         username, theme, _config = resolve_run(args)
         return update(username, theme, force=False, dry=True)
+    if args.watch_spaces:  # resident; takes the lock only around each refresh
+        return watch_spaces()
     lock_fd = acquire_lock()
     if lock_fd is None:
         log.info("another run holds the lock; exiting")
@@ -967,7 +1080,12 @@ def main(argv: list[str] | None = None) -> int:
                       help="restore, verify no screen shows our image, then delete all our files "
                            "(used by uninstall.py)")
     mode.add_argument("--list-themes", action="store_true", help="print the built-in theme names and exit")
+    mode.add_argument("--watch-spaces", action="store_true",
+                      help="stay running and re-apply the cached graph whenever the active Space "
+                           "changes; no network requests (install.py --watch-spaces sets this up)")
     args = parser.parse_args(argv)
+    if args.watch_spaces and (args.user is not None or args.theme is not None):
+        parser.error("--watch-spaces takes no other options; it uses config.json")
     # Handled before logging starts, so these touch no files at all.
     if args.list_themes:
         print("\n".join(sorted(THEMES)))
