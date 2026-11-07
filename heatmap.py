@@ -15,7 +15,7 @@ Exit codes (SPEC §3):
      --uninstall deleted everything
   1  error, including: --dry-run wrote no preview; --restore could not restore every screen;
      --uninstall kept the files because a screen still shows our image; an unknown theme;
-     any command-line usage error
+     an invalid size (given or saved); any command-line usage error
   2  skipped gracefully: no screens, inside a GitHub backoff window, or the lock is busy
   3  --restore / --uninstall only: the lock is busy (uninstall.py waits and retries)
 """
@@ -90,6 +90,13 @@ THEMES = {
 }
 RESET_THEME = "default"                   # `--theme default` clears the saved theme
 HEX_COLOUR_RE = re.compile(r"^#[0-9a-f]{6}$")
+# Grid size (SPEC §7): the grid fits inside a box of W% x H% of the screen. --width/--height
+# (also saved in config.json) take a whole percentage; `default` clears one.
+SIZE_RE = re.compile(r"^([0-9]{1,3})%?$")
+SIZE_MIN, SIZE_MAX = 10, 100
+RESET_SIZE = "default"
+DEFAULT_BOX = (62, 62)                    # neither set: today's look. One set: the other is 100.
+SIZE_KEYS = ("width", "height")
 FALLBACK_SIZE = (2880, 1800)              # dry-run size when no screen is available
 
 # Pruning (SPEC §6): besides the protected PNGs, keep up to RETAIN_EXTRA others rendered in
@@ -200,6 +207,33 @@ def resolve_theme(name: str | None) -> dict[str, Any]:
     return validate_theme(DEFAULT_THEME if name is None else THEMES[name])
 
 
+def parse_size(text: str, flag: str) -> int | None:
+    """A --width/--height value: 'N' or 'N%' with SIZE_MIN <= N <= SIZE_MAX -> N; 'default' -> None."""
+    if text.lower() == RESET_SIZE:
+        return None
+    match = SIZE_RE.fullmatch(text)
+    if match is None or not SIZE_MIN <= int(match[1]) <= SIZE_MAX:
+        raise ValueError(f"{flag}: invalid size {text!r}; expected a whole percentage from "
+                         f"{SIZE_MIN}% to {SIZE_MAX}%, or {RESET_SIZE!r}")
+    return int(match[1])
+
+
+def validate_size(value: Any, key: str) -> int:
+    """Return a size saved in config.json if it is an int in range (not a bool), else raise ValueError."""
+    if not isinstance(value, int) or isinstance(value, bool) or not SIZE_MIN <= value <= SIZE_MAX:
+        raise ValueError(f"saved {key} {value!r} is invalid; expected a whole number from "
+                         f"{SIZE_MIN} to {SIZE_MAX} (fix it with --{key} PCT or --{key} {RESET_SIZE})")
+    return value
+
+
+def effective_box(width: int | None, height: int | None) -> tuple[int, int]:
+    """The (width %, height %) box the grid must fit in: DEFAULT_BOX if neither is set,
+    otherwise an unset dimension is 100 (unconstrained)."""
+    if width is None and height is None:
+        return DEFAULT_BOX
+    return (width or SIZE_MAX, height or SIZE_MAX)
+
+
 # --- Parse and layout (SPEC §5) --------------------------------------------
 
 class CellParser(HTMLParser):
@@ -279,21 +313,30 @@ def layout(cells: dict[str, int]) -> tuple[dict[str, tuple[int, int]], int]:
 
 # --- Render (SPEC §7) ------------------------------------------------------
 
-def render_hash(cells: dict[str, int], width: int, height: int, theme: dict[str, Any]) -> str:
-    """Hash of everything that affects the rendered PNG (SPEC §6), including the theme's colours."""
-    payload = json.dumps({"cells": cells, "w": width, "h": height, "style": STYLE_VERSION, "theme": theme},
-                         sort_keys=True)
+def render_hash(cells: dict[str, int], width: int, height: int, theme: dict[str, Any],
+                box: tuple[int, int]) -> str:
+    """Hash of everything that affects the rendered PNG (SPEC §6): cells, screen size, theme
+    colours and the size box. The default box is left out, so default hashes (and file names)
+    are the same as before sizes existed: no re-render on upgrade, and an older copy of this
+    script still running (e.g. a resident watcher) agrees on the file instead of fighting."""
+    inputs: dict[str, Any] = {"cells": cells, "w": width, "h": height, "style": STYLE_VERSION, "theme": theme}
+    if box != DEFAULT_BOX:
+        inputs["box"] = list(box)
+    payload = json.dumps(inputs, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def render_png(cells: dict[str, int], width: int, height: int, theme: dict[str, Any]) -> bytes:
-    """Draw the heatmap centred on the theme's background and return the PNG bytes."""
+def render_png(cells: dict[str, int], width: int, height: int, theme: dict[str, Any],
+               box: tuple[int, int]) -> bytes:
+    """Draw the heatmap centred on the theme's background, as large as fits inside `box`
+    (percent of width, percent of height) with square cells, and return the PNG bytes."""
     from PIL import Image, ImageDraw  # lazy: only runs when a render is needed
 
     positions, ncols = layout(cells)
-    pitch = 0.62 * width / ncols
-    pitch = min(pitch, 0.62 * height / 7)  # guard: very short histories must still fit vertically
-    side = round(0.76 * pitch)             # square size in whole pixels, same for every cell
+    box_w, box_h = box[0] / 100, box[1] / 100  # 62 / 100 == 0.62 exactly, so the default is unchanged
+    pitch = box_w * width / ncols
+    pitch = min(pitch, box_h * height / 7)  # whichever side of the box is reached first limits the grid
+    side = max(1, round(0.76 * pitch))      # square size in whole pixels, same for every cell
     radius = round(0.22 * side)
     grid_w = (ncols - 1) * pitch + side
     grid_h = 6 * pitch + side
@@ -306,8 +349,12 @@ def render_png(cells: dict[str, int], width: int, height: int, theme: dict[str, 
         x0 = round(left + col * pitch)
         y0 = round(top + row * pitch)
         # Pillow boxes include the end pixel, hence the -1.
-        box = (x0, y0, x0 + side - 1, y0 + side - 1)
-        draw.rounded_rectangle(box, radius=radius, fill=theme["levels"][cells[text]])
+        rect = (x0, y0, x0 + side - 1, y0 + side - 1)
+        fill = theme["levels"][cells[text]]
+        if radius == 0:  # same pixels for side >= 2, but rounded_rectangle draws nothing at side 1
+            draw.rectangle(rect, fill=fill)
+        else:
+            draw.rounded_rectangle(rect, radius=radius, fill=fill)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
@@ -642,11 +689,11 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
 
 
 def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: dict[str, Any],
-                    force: bool, theme: dict[str, Any]) -> None:
+                    force: bool, theme: dict[str, Any], box: tuple[int, int]) -> None:
     """Render (if needed) and set one screen's wallpaper, then record it; raise on failure."""
     key = str(display_id(screen))
     width, height = backing_size(screen)
-    digest = render_hash(cells, width, height, theme)
+    digest = render_hash(cells, width, height, theme, box)
     png = SUPPORT_DIR / f"heatmap-{digest}.png"
     current = wallpaper_path(workspace, screen)
     up_to_date = (state["applied"].get(key) == digest and png.exists() and current is not None
@@ -655,7 +702,7 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
         log.info("display %s: up to date; skipped", key)
         return
     if force or not png.exists():
-        atomic_write_bytes(png, render_png(cells, width, height, theme))
+        atomic_write_bytes(png, render_png(cells, width, height, theme, box))
     set_wallpaper(workspace, screen, str(png), {})
     # Recorded only after the set succeeded. The hash being replaced becomes "previous".
     old = state["applied"].get(key)
@@ -673,7 +720,8 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
         log.warning("display %s: could not read the wallpaper back after setting it (%s)", key, exc)
 
 
-def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any]) -> int:
+def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any],
+                     box: tuple[int, int]) -> int:
     """Update every screen that needs it; return EXIT_OK, EXIT_ERROR or EXIT_SKIPPED."""
     screens, workspace = screens_and_workspace()
     if not screens:
@@ -692,7 +740,7 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, 
     failed = False
     for index, screen in enumerate(screens):
         try:
-            apply_to_screen(workspace, screen, cells, state, force, theme)
+            apply_to_screen(workspace, screen, cells, state, force, theme, box)
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True
@@ -850,16 +898,37 @@ def saved_theme_name(config: dict[str, Any] | None) -> str | None:
     return normalize_theme_name(config.get("theme")) if config is not None else None
 
 
-def save_theme(config: dict[str, Any] | None, name: str | None) -> None:
-    """Persist `--theme` in config.json, keeping every other key. Call only under the lock."""
+def saved_size(config: dict[str, Any] | None, key: str) -> int | None:
+    """The size saved under `key` ("width" / "height") in config.json; None if absent.
+    ValueError if present but invalid (including null), never a silent fall back."""
+    if config is None or key not in config:
+        return None
+    return validate_size(config[key], key)
+
+
+def setting_changes(args: argparse.Namespace) -> dict[str, Any]:
+    """The settings this run was asked to save: {key: value}, where None removes the key."""
+    changes: dict[str, Any] = {}
+    if args.theme is not None:
+        changes["theme"] = args.theme_name
+    for key in SIZE_KEYS:
+        if getattr(args, key) is not None:
+            changes[key] = getattr(args, f"{key}_pct")
+    return changes
+
+
+def save_settings(config: dict[str, Any] | None, changes: dict[str, Any]) -> None:
+    """Persist `--theme` / `--width` / `--height` in config.json, keeping every other key;
+    a None value removes that key (back to the default). Call only under the lock."""
     if config is None or "username" not in config:
-        raise ValueError("not installed: run install.py --user NAME --theme THEME instead")
+        raise ValueError("not installed: run install.py --user NAME (it also takes --theme, --width "
+                         "and --height) instead")
     validate_username(config["username"])
-    updated = {key: value for key, value in config.items() if key != "theme"}
-    if name is not None:
-        updated["theme"] = name
+    updated = {key: value for key, value in config.items() if key not in changes}
+    updated.update({key: value for key, value in changes.items() if value is not None})
     atomic_write_json(CONFIG_FILE, updated)
-    log.info("theme set to %s", name or RESET_THEME)
+    log.info("saved %s", ", ".join(f"{key}={RESET_THEME if value is None else value}"
+                                   for key, value in changes.items()))
 
 
 def screens_available() -> bool:
@@ -868,7 +937,7 @@ def screens_available() -> bool:
     return bool(screens)
 
 
-def update(username: str, theme: dict[str, Any], force: bool, dry: bool) -> int:
+def update(username: str, theme: dict[str, Any], box: tuple[int, int], force: bool, dry: bool) -> int:
     """Fetch, then refresh stale screens (or, with dry=True, only write preview.png).
 
     force=True ignores the ETag and up-to-date checks and re-renders and re-applies on
@@ -895,47 +964,53 @@ def update(username: str, theme: dict[str, Any], force: bool, dry: bool) -> int:
             return EXIT_ERROR
         return EXIT_SKIPPED
     if not dry:
-        return apply_to_screens(cells, state, force, theme)
+        return apply_to_screens(cells, state, force, theme, box)
     from AppKit import NSScreen  # dry run: render at the main screen's size, touch nothing else
 
     screen = NSScreen.mainScreen()
     width, height = backing_size(screen) if screen is not None else FALLBACK_SIZE
-    atomic_write_bytes(PREVIEW_FILE, render_png(cells, width, height, theme))
-    log.info("dry run: wrote %s (%dx%d, %d cells); wallpaper unchanged", PREVIEW_FILE, width, height, len(cells))
+    atomic_write_bytes(PREVIEW_FILE, render_png(cells, width, height, theme, box))
+    log.info("dry run: wrote %s (%dx%d, %d cells, box %d%% x %d%%); wallpaper unchanged",
+             PREVIEW_FILE, width, height, len(cells), *box)
     return EXIT_OK
 
 
-def resolve_run(args: argparse.Namespace) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
-    """Read config.json once and validate the username and theme for this run, before any
-    fetch or state write. Returns (username, theme colours, config)."""
+def resolve_run(args: argparse.Namespace) -> tuple[str, dict[str, Any], tuple[int, int], dict[str, Any] | None]:
+    """Read config.json once and validate the username, theme and size for this run, before any
+    config, fetch or state write. A flag given on the command line replaces the saved value
+    (so `--width default` gets past an invalid saved width). Returns (username, theme
+    colours, size box, config)."""
     config = load_config()
     username = resolve_username(args.user, config)
     name = args.theme_name if args.theme is not None else saved_theme_name(config)
-    return username, resolve_theme(name), config
+    width, height = (getattr(args, f"{key}_pct") if getattr(args, key) is not None else saved_size(config, key)
+                     for key in SIZE_KEYS)
+    return username, resolve_theme(name), effective_box(width, height), config
 
 
 def run(args: argparse.Namespace) -> int:
     """Dispatch to the requested mode, holding the lock where state is touched."""
     if args.dry_run:  # writes only preview.png (and the log), so no lock is needed; saves nothing
-        username, theme, _config = resolve_run(args)
-        return update(username, theme, force=False, dry=True)
+        username, theme, box, _config = resolve_run(args)
+        return update(username, theme, box, force=False, dry=True)
     lock_fd = acquire_lock()
     if lock_fd is None:
         log.info("another run holds the lock; exiting")
         return EXIT_LOCK_BUSY if (args.restore or args.uninstall) else EXIT_SKIPPED
     try:  # the lock is held for the whole mode, including --uninstall's deletion
-        if args.restore:  # restore and uninstall never read config.json, so a bad theme can't block them
+        if args.restore:  # restore and uninstall never read config.json, so a bad setting can't block them
             return restore()
         if args.uninstall:
             return uninstall()
-        username, theme, config = resolve_run(args)
-        if args.theme is not None:
+        username, theme, box, config = resolve_run(args)
+        changes = setting_changes(args)
+        if changes:
             # Saved before fetching: config.json records the choice, state.json's `applied`
             # records progress, so a skipped or failed run is completed by a later one.
-            save_theme(config, args.theme_name)
-        code = update(username, theme, force=args.force, dry=False)
-        if args.theme is not None and code == EXIT_SKIPPED:
-            log.info("theme saved; it will be applied on the next successful run")
+            save_settings(config, changes)
+        code = update(username, theme, box, force=args.force, dry=False)
+        if changes and code == EXIT_SKIPPED:
+            log.info("settings saved; they will be applied on the next successful run")
         return code
     finally:
         os.close(lock_fd)
@@ -956,6 +1031,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--theme", metavar="NAME",
                         help="change the colour theme: saved to config.json and applied now; with "
                              "--dry-run, only previewed; 'default' is the green look (see --list-themes)")
+    parser.add_argument("--width", metavar="PCT",
+                        help="largest grid width, as a percentage of the screen (10%%-100%%, the %% is optional): "
+                             "saved and applied like --theme; 'default' clears it")
+    parser.add_argument("--height", metavar="PCT",
+                        help="largest grid height, as a percentage of the screen; the grid keeps square cells "
+                             "and fits inside both limits; 'default' clears it")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="render preview.png only; do not set the wallpaper")
     mode.add_argument("--force", action="store_true",
@@ -968,13 +1049,20 @@ def main(argv: list[str] | None = None) -> int:
                            "(used by uninstall.py)")
     mode.add_argument("--list-themes", action="store_true", help="print the built-in theme names and exit")
     args = parser.parse_args(argv)
-    # Handled before logging starts, so these touch no files at all.
+    # Checked before logging starts, so these touch no files at all.
+    for key in SIZE_KEYS:
+        try:
+            value = getattr(args, key)
+            setattr(args, f"{key}_pct", parse_size(value, f"--{key}") if value is not None else None)
+        except ValueError as exc:
+            parser.error(str(exc))
+    given = [f"--{key}" for key in ("theme", *SIZE_KEYS) if getattr(args, key) is not None]
+    if given and (args.restore or args.uninstall or args.list_themes):
+        parser.error(f"{', '.join(given)} cannot be used with --restore, --uninstall or --list-themes")
     if args.list_themes:
         print("\n".join(sorted(THEMES)))
         return EXIT_OK
     if args.theme is not None:
-        if args.restore or args.uninstall:
-            parser.error("--theme cannot be used with --restore or --uninstall")
         try:
             args.theme_name = normalize_theme_name(args.theme)
         except ValueError as exc:

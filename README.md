@@ -13,7 +13,7 @@ Design contract: [SPEC.md](SPEC.md).
 Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
 
 ```sh
-python3 install.py --user YOUR_GITHUB_NAME     # optional: --theme nord, --interval 600
+python3 install.py --user YOUR_GITHUB_NAME     # optional: --theme nord, --width 40%, --interval 600
 python3 uninstall.py
 ```
 
@@ -54,12 +54,34 @@ Only the desktop you are on changes at once. Other desktops (Spaces) switch the 
 time a run happens while you are on them; run `uv run heatmap.py` there to switch now
 (during a GitHub backoff it skips, like any other run).
 
+## Size
+
+By default the grid fills about 62% of the screen's width. `--width` and `--height` set the
+largest it may be, as a percentage of the screen (10% to 100%, the `%` is optional):
+
+```sh
+uv run heatmap.py --dry-run --width 40%          # preview only; saves nothing
+uv run heatmap.py --width 40%                    # at most 40% of the screen wide
+uv run heatmap.py --height 15%                   # at most 15% of the screen tall
+uv run heatmap.py --width 80% --height 40%       # fits inside both
+uv run heatmap.py --width default                # forget the saved width
+```
+
+The squares stay square, so the grid grows until it reaches either limit. A year of
+contributions is about 7.5 times wider than tall, so usually the width wins: `--width 80%
+--height 40%` gives a grid about 80% wide and 16% tall. Each flag is saved on its own, so
+`--width 80%` keeps a height you saved earlier; a dimension you never set (or set back to
+`default`) is unlimited. So `--height` on its own can make the grid bigger than the
+default: `--height 25%` hits the screen's width first and runs nearly edge to edge (about
+20% tall on a 16:10 screen); pair it with `--width` to keep it smaller. Like the theme, the size is saved in `config.json`, applies to every display
+in proportion to its own size, and is kept on a reinstall unless you pass the flag again.
+
 ## Other flags
 
 `--force` (skip the ETag and up-to-date checks and re-render on every display;
 it still respects a GitHub backoff and still falls back to cached data when offline) and
 `--restore` (put the saved wallpaper back; deletes nothing). Exit codes: 0 means OK,
-1 means error (including an unknown theme or a bad flag), 2 means skipped (no screens, backoff, or another run in progress), and 3
+1 means error (including an unknown theme, a bad size or a bad flag), 2 means skipped (no screens, backoff, or another run in progress), and 3
 means `--restore`/`--uninstall` found the lock busy.
 
 ## Files it creates
@@ -107,7 +129,8 @@ python3 install.py --user YOUR_GITHUB_NAME
 ```
 
 A reinstall never overwrites an existing `backup.json`, so your real original wallpaper
-is kept. It also keeps your saved theme unless you pass `--theme`.
+is kept. It also keeps your saved theme and size unless you pass `--theme`, `--width` or
+`--height`.
 
 ## Auditing
 
