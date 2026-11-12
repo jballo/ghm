@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Install gh-heatmap for the current user (SPEC §10).
 
-Usage: python3 install.py --user NAME [--theme NAME] [--interval 600]
+Usage: python3 install.py --user NAME [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
 
-Runs `uv sync --locked`, writes config.json (keeping a saved theme unless --theme is given),
+Runs `uv sync --locked`, writes config.json (keeping a saved theme and size unless the flag is given),
 does one run by hand (which must succeed
 and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. Everything lives under $HOME; no sudo. Uses only the
 standard library so it runs on any Python 3.9+ (including macOS's /usr/bin/python3).
@@ -23,11 +23,17 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
-# These paths, the regex and the theme names must match heatmap.py (`heatmap.py --list-themes`).
+# These paths, the regexes, the size range and the theme names must match heatmap.py
+# (`heatmap.py --list-themes`).
 USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 THEME_NAMES = ("dracula", "gruvbox", "nord", "panda", "tokyo-night")
 RESET_THEME = "default"
+SIZE_RE = re.compile(r"^([0-9]{1,3})%?$")
+SIZE_MIN, SIZE_MAX = 10, 100
+RESET_SIZE = "default"
+SIZE_KEYS = ("width", "height")
 LABEL = "local.gh-heatmap"
 PROJECT_DIR = Path(__file__).resolve().parent
 VENV_PYTHON = PROJECT_DIR / ".venv" / "bin" / "python"
@@ -78,28 +84,62 @@ def acquire_lock() -> int:
     sys.exit("gave up waiting for the gh-heatmap lock; config.json not written, nothing scheduled")
 
 
-def saved_theme() -> str | None:
-    """The theme in an existing config.json, so a reinstall keeps it (SPEC §10). Anything
-    unusable is dropped with a warning instead of failing the install; None = default."""
+def parse_size(text: str, flag: str) -> int | None:
+    """A --width/--height value: 'N' or 'N%' with SIZE_MIN <= N <= SIZE_MAX -> N; 'default' -> None.
+    Exits 1 on anything else (same rule as heatmap.py)."""
+    if text.lower() == RESET_SIZE:
+        return None
+    match = SIZE_RE.fullmatch(text)
+    if match is None or not SIZE_MIN <= int(match[1]) <= SIZE_MAX:
+        sys.exit(f"{flag}: invalid size {text!r}; expected a whole percentage from "
+                 f"{SIZE_MIN}% to {SIZE_MAX}%, or {RESET_SIZE!r}")
+    return int(match[1])
+
+
+def saved_settings(overridden: set[str]) -> dict[str, Any]:
+    """The theme, width and height in an existing config.json, so a reinstall keeps them
+    (SPEC §10). Keys in `overridden` (given on the command line) are not read. Anything
+    unusable is dropped with a warning instead of failing the install; absent = default."""
+    wanted = {"theme", *SIZE_KEYS} - overridden
+    if not wanted:
+        return {}
     try:
         config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None
+        return {}
     except (OSError, ValueError) as exc:
-        print(f"warning: could not read {CONFIG_FILE} ({exc}); not keeping its theme")
-        return None
-    theme = config.get("theme") if isinstance(config, dict) else None
+        print(f"warning: could not read {CONFIG_FILE} ({exc}); not keeping its settings")
+        return {}
     if not isinstance(config, dict):
-        print(f"warning: {CONFIG_FILE} is not a JSON object; not keeping its theme")
-    elif theme is not None and not isinstance(theme, str):
+        print(f"warning: {CONFIG_FILE} is not a JSON object; not keeping its settings")
+        return {}
+    kept: dict[str, Any] = {}
+    theme = config.get("theme")
+    if "theme" not in wanted or theme is None:
+        pass
+    elif not isinstance(theme, str):
         print(f"warning: saved theme {theme!r} is not a name; using the default")
-    elif isinstance(theme, str):
-        name = theme.lower()
-        if name in THEME_NAMES:
-            return name
-        if name != RESET_THEME:
-            print(f"warning: saved theme {theme!r} is unknown; using the default")
-    return None
+    elif theme.lower() in THEME_NAMES:
+        kept["theme"] = theme.lower()
+    elif theme.lower() != RESET_THEME:
+        print(f"warning: saved theme {theme!r} is unknown; using the default")
+    for key in SIZE_KEYS:
+        if key not in wanted or key not in config:
+            continue
+        value = config[key]
+        if isinstance(value, int) and not isinstance(value, bool) and SIZE_MIN <= value <= SIZE_MAX:
+            kept[key] = value
+        else:
+            print(f"warning: saved {key} {value!r} is not a whole number from {SIZE_MIN} to {SIZE_MAX}; "
+                  "using the default")
+    return kept
+
+
+def describe(config: dict[str, Any]) -> str:
+    """'theme: nord, width: 40%, height: default' for the install summary."""
+    parts = [f"theme: {config.get('theme', RESET_THEME)}"]
+    parts += [f"{key}: {config[key]}%" if key in config else f"{key}: {RESET_SIZE}" for key in SIZE_KEYS]
+    return ", ".join(parts)
 
 
 def backup_ok() -> bool:
@@ -130,13 +170,28 @@ def build_plist(interval: int) -> dict:
     }
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse, except usage errors exit 1 like every other bad input here (argparse uses 2,
+    e.g. for `--width -10%`, which it reads as an option rather than a value)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def main() -> int:
     """Run the install steps in order; stop at the first failure."""
-    parser = argparse.ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
+    parser = ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
     parser.add_argument("--user", required=True, metavar="NAME", help="GitHub username")
     parser.add_argument("--theme", metavar="NAME",
                         help=f"colour theme: {', '.join(THEME_NAMES)}, or {RESET_THEME} (the green look). "
                              "Omitted: keep the saved theme on a reinstall, else default")
+    parser.add_argument("--width", metavar="PCT",
+                        help="largest grid width as a percentage of the screen (10%%-100%%), or "
+                             f"{RESET_SIZE}. Omitted: keep the saved width on a reinstall, else default")
+    parser.add_argument("--height", metavar="PCT",
+                        help="largest grid height as a percentage of the screen (10%%-100%%), or "
+                             f"{RESET_SIZE}. Omitted: keep the saved height on a reinstall, else default")
     parser.add_argument("--interval", type=int, default=600, help="seconds between runs (default 600)")
     args = parser.parse_args()
 
@@ -145,9 +200,15 @@ def main() -> int:
         sys.exit(f"invalid GitHub username: {args.user!r}")
     if args.interval < 60:
         sys.exit("--interval must be at least 60 seconds")
-    # Checked before uv sync, so an unknown name changes nothing at all.
+    # Checked before uv sync, so an unknown name or bad size changes nothing at all.
     if args.theme is not None and args.theme.lower() not in THEME_NAMES + (RESET_THEME,):
         sys.exit(f"unknown theme {args.theme!r}; valid: {', '.join(THEME_NAMES)} (or {RESET_THEME!r})")
+    given: dict[str, Any] = {}  # flags given on the command line; None = back to the default
+    if args.theme is not None:
+        given["theme"] = None if args.theme.lower() == RESET_THEME else args.theme.lower()
+    for key in SIZE_KEYS:
+        if getattr(args, key) is not None:
+            given[key] = parse_size(getattr(args, key), f"--{key}")
     uv = shutil.which("uv")
     if uv is None:
         sys.exit("uv not found on PATH; install it first (https://docs.astral.sh/uv/)")
@@ -162,17 +223,14 @@ def main() -> int:
     SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
     lock_fd = acquire_lock()
     try:
-        if args.theme is None:
-            theme = saved_theme()
-        else:
-            theme = None if args.theme.lower() == RESET_THEME else args.theme.lower()
-        config = {"username": args.user}
-        if theme is not None:
-            config["theme"] = theme
+        # Each setting independently: the flag if given, else the saved value, else default.
+        settings = {**saved_settings(set(given)), **given}
+        config: dict[str, Any] = {"username": args.user}
+        config.update({key: settings[key] for key in ("theme", *SIZE_KEYS) if settings.get(key) is not None})
         atomic_write_bytes(CONFIG_FILE, (json.dumps(config, indent=2) + "\n").encode("utf-8"))
     finally:
         os.close(lock_fd)
-    print(f"==> wrote {CONFIG_FILE} (theme: {theme or RESET_THEME})")
+    print(f"==> wrote {CONFIG_FILE} ({describe(config)})")
 
     # 4. First run by hand: captures backup.json and surfaces errors before scheduling.
     #    heatmap.py exits 0 only if every screen was applied or already up to date;
@@ -199,8 +257,9 @@ def main() -> int:
 
     # 7. Report.
     print(f"\nInstalled {LABEL}: runs every {args.interval} s for GitHub user {args.user} "
-          f"(theme: {theme or RESET_THEME}).")
+          f"({describe(config)}).")
     print(f"  theme:     cd {PROJECT_DIR} && uv run heatmap.py --theme NAME   (--list-themes for names)")
+    print(f"  size:      cd {PROJECT_DIR} && uv run heatmap.py --width 40% --height 30%   ({RESET_SIZE} resets)")
     print(f"  check:     launchctl print {domain}/{LABEL}")
     print("  log:       ~/Library/Logs/gh-heatmap.log")
     print(f"  uninstall: python3 {PROJECT_DIR / 'uninstall.py'}")

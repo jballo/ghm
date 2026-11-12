@@ -40,8 +40,9 @@ Runtime files (all created by `heatmap.py`):
 
 ```
 ~/Library/Application Support/gh-heatmap/
-  config.json          {"username": "...", "theme": "nord"}   written by install.py and by
-                       `heatmap.py --theme`; "theme" is absent for the default look
+  config.json          {"username": "...", "theme": "nord", "width": 40, "height": 25}
+                       written by install.py and by `heatmap.py --theme/--width/--height`;
+                       "theme", "width" and "height" are each absent for the default
   state.json           see §6
   backup.json          original wallpaper per display, captured once, before first change
   heatmap-<hash>.png   rendered wallpapers (current, previous, live, and up to 50 more
@@ -66,10 +67,18 @@ heatmap.py --theme NAME    change the theme: save it in config.json (under the l
                            usual, so it applies now. Case-insensitive; `default` removes the saved
                            theme. Needs an installed config.json (exit 1 otherwise; it never
                            creates one). Not allowed with --restore / --uninstall.
+heatmap.py --width PCT     largest grid width / height as a percentage of the screen (§7):
+heatmap.py --height PCT    a whole number 10-100, the `%` optional (`40`, `40%`). Saved in
+                           config.json and applied like --theme; each is saved or cleared on its
+                           own (`--width 40%` keeps a saved height); `default` removes it. Same
+                           rules as --theme: needs an installed config.json, not allowed with
+                           --restore / --uninstall / --list-themes. Checked before logging
+                           starts: a bad value is exit 1 with nothing written
 heatmap.py --list-themes   print the five theme names, one per line, and exit 0. Handled before
-                           logging starts: reads and writes no files, takes no lock
+                           logging starts: reads and writes no files, takes no lock. With
+                           --theme / --width / --height it is a usage error (exit 1)
 heatmap.py --dry-run       fetch + render to ~/Library/Application Support/gh-heatmap/preview.png; do NOT set wallpaper.
-                           With --theme NAME, previews that theme and saves nothing
+                           With --theme / --width / --height, previews them and saves nothing
 heatmap.py --force         ignore ETag and up-to-date checks; re-render and re-apply on every
                            display; still honours a recorded GitHub backoff and falls back to
                            cached data if the network fails
@@ -83,21 +92,24 @@ Exit codes:
 | code | meaning |
 |------|---------|
 | 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything; `--list-themes` |
-| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme (given or saved); `--theme` with no config.json; any usage error (argparse is made to exit 1, because 2 means "skipped") |
+| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme (given or saved); an invalid size (given, or saved: anything but an int 10-100, including `null`, `true` and `40.0`); `--theme` / `--width` / `--height` with no config.json; any usage error (argparse is made to exit 1, because 2 means "skipped") |
 | 2 | skipped gracefully (scheduled run): no screens, inside a GitHub backoff window, or the lock is busy |
 | 3 | `--restore` / `--uninstall` only: the lock is busy (uninstall.py waits and retries) |
 
 install.py relies on these codes to verify the first run (§10).
 
-`--theme NAME` on a real run: the username and theme are validated first (any failure is
-exit 1 with nothing written), then the theme is saved, then the run proceeds as usual and
-its exit code is returned unchanged. A saved theme never turns 1 or 2 into 0: if the run
-is skipped (2) or a screen fails (1), the next successful run applies the saved theme.
+`--theme NAME`, `--width PCT` or `--height PCT` on a real run: the username, theme and both
+sizes in effect are validated first (any failure is exit 1 with nothing written), then the
+given settings are saved together, then the run proceeds as usual and its exit code is
+returned unchanged. A saved setting never turns 1 or 2 into 0: if the run is skipped (2) or
+a screen fails (1), the next successful run applies it.
 
-Config and theme are read once per run, after `--restore` / `--uninstall` have been
-dispatched (those never read config.json, so a bad theme cannot block recovery) and
-before the backoff check, fetch or any `state.json` write. An unknown saved theme is
-exit 1, never a silent fall back to the default.
+Config, theme and size are read once per run, after `--restore` / `--uninstall` have been
+dispatched (those never read config.json, so a bad setting cannot block recovery) and
+before the backoff check, fetch or any `state.json` write. A flag given on the command
+line replaces the saved value without validating it, so `--width default` clears an invalid
+saved width. An unknown saved theme or invalid saved size is exit 1, never a silent fall
+back to the default.
 Logging: `logging` to the rotating file; also to stderr when stderr is a TTY.
 
 ## 4. Fetch
@@ -168,9 +180,13 @@ Cells not present (edge padding) are simply not drawn.
 ```
 
 `render_hash = sha256(json.dumps({"cells": cells, "w": W, "h": H,
-"style": STYLE_VERSION, "theme": THEME}, sort_keys=True))[:16]`, where `THEME` is the
-resolved colours (`{"background", "levels"}`), not the name, so changing theme or
-editing a palette re-renders every display. `STYLE_VERSION` is a module constant; bump
+"style": STYLE_VERSION, "theme": THEME, "box": [BW, BH]}, sort_keys=True))[:16]`, where
+`THEME` is the resolved colours (`{"background", "levels"}`), not the name, so changing
+theme or editing a palette re-renders every display, and `[BW, BH]` is the effective size
+box in percent (§7), so a size change does too. `"box"` is left out when the box is the
+default `(62, 62)`, so default hashes match the ones from before sizes existed: upgrading
+re-renders nothing, and an older copy of the script still running (a resident process)
+names the same file instead of re-setting a differently named copy of the same image. `STYLE_VERSION` is a module constant; bump
 it whenever rendering output changes in a way the inputs above don't capture.
 
 Per display, per run:
@@ -197,8 +213,8 @@ Per display, per run:
    file name. A PNG whose mtime can't be read is kept. Everything else is deleted.
    Why: we can only see each screen's *current* Space (§8), but other Spaces, and
    displays that are not connected, keep pointing at the PNG they last showed. A new PNG
-   appears whenever the graph's levels, its date window, the screen size or the theme
-   change, so keeping only current + previous left most other Spaces pointing at deleted
+   appears whenever the graph's levels, its date window, the screen size, the theme or
+   the grid size (`--width` / `--height`) change, so keeping only current + previous left most other Spaces pointing at deleted
    files. Retention makes that rare; it can't rule it out (a Space left alone for more
    than 14 days or 50 renders can still point at a deleted PNG). PNGs are ~32 KB, so
    the cap costs under ~2 MB. mtime is the render time; it is never touched afterwards.
@@ -210,15 +226,24 @@ Concurrency: `fcntl.flock(LOCK_EX | LOCK_NB)` on `gh-heatmap.lock` (§2; its par
 created first); if busy, log and exit 2
 (`--restore`: exit 3). `--dry-run` takes no lock: it writes only `preview.png` and the
 log, and never writes `state.json` or `config.json`. `--list-themes` takes no lock and
-touches no files. `heatmap.py --theme` and `install.py` read and rewrite `config.json` only
+touches no files. `heatmap.py --theme/--width/--height` and `install.py` read and rewrite `config.json` only
 while holding this lock, so neither can lose the other's update.
 
 ## 7. Render (Pillow, imported lazily only when a render is needed)
 
 - Backing size per screen: `r = screen.convertRectToBacking_(screen.frame())`,
   `W, H = int(r.size.width), int(r.size.height)`.
-- Grid occupies ~62 % of W: `pitch = 0.62 * W / ncols`; square `size = 0.76 * pitch`;
-  `radius = 0.22 * size`; grid is centred horizontally and vertically.
+- Size box `(BW, BH)` in percent of the screen: `(62, 62)` if neither `width` nor `height`
+  is set; otherwise the set ones, with an unset one `100` (unconstrained). The grid keeps
+  square cells and is as large as fits inside the box, centred horizontally and vertically:
+  `pitch = min(BW/100 * W / ncols, BH/100 * H / 7)`; square `size = max(1, round(0.76 * pitch))`;
+  `radius = round(0.22 * size)`. Because the grid is ~7.5:1 for a full year, usually only one
+  side of the box is reached (`--width 80% --height 40%` on 16:10 is ~80% wide, ~16% tall).
+  `grid = (ncols - 1) * pitch + size` leaves ~0.24 pitch of the box unused: ~99.5% of the
+  width for a full year, ~96.6% of the height when height limits, less for histories of
+  only a few weeks. `62 / 100 == 0.62`, so the default box renders exactly as before the
+  box existed. A cell with radius 0 is drawn with `rectangle` (same pixels from size 2 up;
+  `rounded_rectangle` draws nothing at size 1).
 - Colours come from the theme: a background plus levels 0–4 (`DEFAULT_THEME` /
   `THEMES` in heatmap.py; every one passes `validate_theme`: exactly the keys
   `background` and `levels`, 5 levels, all lowercase `#rrggbb`).
@@ -318,22 +343,26 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
 ## 10. `install.py`
 
 ```
-install.py --user NAME [--theme NAME] [--interval 600]
+install.py --user NAME [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
 ```
 
-1. Validate username (same regex) and `--theme` (case-insensitive; one of
-   `THEME_NAMES`, which must match `heatmap.py --list-themes`, or `default`). Both are
-   checked before anything else, so a bad name changes nothing. Require `uv` on PATH
+1. Validate username (same regex), `--theme` (case-insensitive; one of
+   `THEME_NAMES`, which must match `heatmap.py --list-themes`, or `default`) and
+   `--width` / `--height` (same rule as heatmap.py, §3). All are checked before anything
+   else, so a bad value changes nothing (exit 1). Require `uv` on PATH
    (`shutil.which`).
 2. `uv sync --locked` in the project dir (uses `uv.lock` exactly; fails if the lock
    is missing or out of date with `pyproject.toml` — that is the hash-pinning guarantee.
    `--frozen` would not detect a stale lock).
 3. Create the support dir. Take the lock (§6; retry every 2 s, about 30 s, then exit 1),
    write `config.json` atomically, release the lock (the first run takes it itself).
-   Theme: `--theme NAME` if given (`default` = none). Otherwise a reinstall keeps the
-   theme saved in the existing config.json, lowercased; if that file is unreadable, not
-   a JSON object, or its theme is not a known name, it prints a warning and uses the
-   default instead of failing.
+   Theme, width and height are each resolved on their own: the flag if given (`default`
+   = none); otherwise a reinstall keeps the value saved in the existing config.json (the
+   theme lowercased), so `install.py --theme nord` keeps a saved size. The file is read
+   once, under the lock. If it is unreadable or not a JSON object, or a saved value that
+   is not overridden is invalid (an unknown theme; a size that is not an int 10-100), it
+   prints a warning and uses the default for that setting instead of failing. Other keys
+   are not kept.
 4. First run by hand: `.venv/bin/python heatmap.py`. It must exit 0, and afterwards
    `backup.json` must exist or `state.json["backup_not_needed"]` must be `true` (every
    screen's wallpaper was already ours). Otherwise abort before writing the plist
@@ -419,4 +448,13 @@ restore, so a later run deletes whatever remains.
     `heatmap.py --theme default` → green, `"theme"` gone. Reinstall without `--theme` keeps
     the saved theme. `install.py --theme bogus` and `heatmap.py --theme bogus` exit 1 and
     change nothing.
+4b. `heatmap.py --width 40%` → smaller grid on every display, config.json has `"width": 40`,
+    the theme untouched. `--height 25%` → `"height": 25` too; `--width default` → `"width"`
+    gone, box 100% × 25%: on 16:10 the width runs out first, so the grid is nearly full
+    width (~99.6%) and ~20% tall. `install.py --user jballo --theme nord` keeps `"height": 25`.
+    `--dry-run --width 80% --height 40%` writes preview.png and leaves config.json and
+    state.json unchanged. `--width 5%`, `--width 40.5%`, `--list-themes --width 40`
+    and `--restore --width 40` exit 1. With no size set, the PNG name is the same as
+    before this feature (no re-render on upgrade). Hand-edit `"width": "big"` → a run exits 1,
+    `--restore` still works, `--width default` fixes it.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
