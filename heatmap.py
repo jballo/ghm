@@ -108,6 +108,7 @@ T3CODE_DB = Path.home() / ".t3" / "userdata" / "statev2.sqlite"
 T3CODE_QUERY = "SELECT requested_at FROM orchestration_v2_projection_runs"
 T3CODE_DB_TIMEOUT = 2
 T3CODE_WINDOW_DAYS = 364
+T3CODE_CELLS_KEY = "t3code_cells"
 LEVEL_MAX = 4
 
 # Pruning (SPEC §6): besides the protected PNGs, keep up to RETAIN_EXTRA others rendered in
@@ -1046,11 +1047,11 @@ class WatchCache:
         self.box = effective_box(*(saved_size(config, key) for key in SIZE_KEYS))
         if mode == MODE_T3CODE:
             self.state = load_state(None)
-            self.cells = t3code_cells(dt.date.today())
+            cached = self.state.get(T3CODE_CELLS_KEY)
         else:
             self.state = load_state(resolve_username(None, config))
             cached = self.state.get("cells")
-            self.cells = validate_cells(cached, dt.date.today()) if cached else None
+        self.cells = validate_cells(cached, dt.date.today()) if cached else None
         self.backed_up = {entry["display"] for entry in (load_backup() or [])}
         self.digests = {}
 
@@ -1357,6 +1358,9 @@ def update(mode: str, username: str | None, theme: dict[str, Any], box: tuple[in
         return EXIT_SKIPPED
     if mode == MODE_T3CODE:
         cells = t3code_cells(dt.date.today())
+        if not dry:
+            state[T3CODE_CELLS_KEY] = cells
+            atomic_write_json(STATE_FILE, state)
     else:
         github_cells = get_cells(username, state, use_etag=not force)
         if not dry:

@@ -243,6 +243,9 @@ with this project; its database layout is internal to it and may change.
 In t3code mode `etag`, `cells`, `fetched_at`, `retry_until` and `username` are neither used
 nor changed (the state is loaded with no username), so switching back to GitHub resumes with
 a normal conditional request, and a recorded GitHub backoff does not stop t3code runs.
+Instead, a real (not dry) t3code run that has read its cells saves them as `t3code_cells`
+and writes `state.json` before applying them; the Space watcher (§13) uses that snapshot,
+so it never reads T3 Code's database. GitHub mode never reads or writes `t3code_cells`.
 `applied`, `applied_prev` and `backup_not_needed` are shared by both modes.
 
 `render_hash = sha256(json.dumps({"cells": cells, "w": W, "h": H,
@@ -566,9 +569,9 @@ restore, so a later run deletes whatever remains.
     the swipe ends (the set happens a few ms after the switch), and no fetch for it. Switch with the network off → still updates.
     `install.py --user jballo` (no flag) keeps the watcher; `--no-watch-spaces` removes it.
     `heatmap.py --width 40%` on desktop 1, swipe to desktop 2 → the smaller grid there too.
-    `heatmap.py --mode t3code` on desktop 1, swipe → the T3 Code grid on desktop 2, and the
-    log shows a `t3code:` line from the watcher's reload; `--mode github` and swipe back →
-    the GitHub grid.
+    `heatmap.py --mode t3code` on desktop 1, swipe → the T3 Code grid on desktop 2, with no
+    `t3code:` log line from the watcher (it uses the saved snapshot); `--mode github` and
+    swipe back → the GitHub grid.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.
 
 ## 13. Space watcher (opt-in)
@@ -627,11 +630,13 @@ lock, several displays or system load can add delay.
   them only when `config.json`, `state.json` or `backup.json` change (inode, mtime, size) or
   the date changes. The saved mode, theme and size are read exactly as a scheduled run reads
   them (§3); an invalid one is a logged refresh error. Cells: in GitHub mode, the cached
-  `state.json` cells for the saved username; in t3code mode, a fresh read of T3 Code's
-  database (§5a) on each reload. Every scheduled run rewrites `state.json`, so the watcher's
-  data is never older than the last scheduled run's, and the database is read at most once
-  per reload, not on every Space change. The lock file stays open; each refresh only flocks
-  and unflocks it.
+  `state.json` `cells` for the saved username; in t3code mode, the `t3code_cells` snapshot
+  the last scheduled t3code run saved (§6). So the watcher never reads T3 Code's database
+  and never waits on it inside the Space-change callback. A scheduled run that reaches its
+  cells writes `state.json` before applying them, so the watcher's next reload uses the same
+  cells that run applied. A run that stops earlier (no screens, a database error) applies
+  nothing new and leaves the snapshot as it was. The lock file stays open; each refresh
+  only flocks and unflocks it.
   - **Quick path** (the usual case): every connected display is already in `backup.json`,
     `state.json` `applied` records the PNG for the current cells, size and theme, and that
     PNG exists. Then set that PNG on each screen straight away, without first asking

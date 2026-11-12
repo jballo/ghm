@@ -144,9 +144,9 @@ any reader of that database does; the database itself is never changed.
   until a run happens on it.
 - **Optional: update a Space as you switch to it.** `install.py --watch-spaces` adds a
   small process that stays running (about 85 MB of memory, no CPU while idle). When you
-  switch Spaces, macOS tells it, and it re-applies the current graph (the last downloaded
-  one, or in T3 Code mode the one from T3 Code's database) with your saved theme and size,
-  usually within a few ms, with no network request. You still see the old image during the swipe
+  switch Spaces, macOS tells it, and it re-applies the graph the last scheduled run applied
+  (GitHub or T3 Code, with your saved theme and size), usually within a few ms, with no
+  network request and without opening T3 Code's database. You still see the old image during the swipe
   and a short macOS fade to the new one: macOS only says you switched once you've
   arrived. Spaces you don't visit still keep their old image.
   Turn it off with `install.py --user YOUR_GITHUB_NAME --no-watch-spaces`; a reinstall
