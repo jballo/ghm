@@ -21,6 +21,7 @@ Exit codes (SPEC §3):
 """
 
 import argparse
+import bisect
 import datetime as dt
 import fcntl
 import hashlib
@@ -99,6 +100,14 @@ DEFAULT_BOX = (62, 62)                    # neither set: today's look. One set: 
 SIZE_KEYS = ("width", "height")
 FALLBACK_SIZE = (2880, 1800)              # dry-run size when no screen is available
 
+MODE_GITHUB, MODE_T3CODE = "github", "t3code"
+MODES = (MODE_GITHUB, MODE_T3CODE)
+T3CODE_DB = Path.home() / ".t3" / "userdata" / "statev2.sqlite"
+T3CODE_QUERY = "SELECT requested_at FROM orchestration_v2_projection_runs"
+T3CODE_DB_TIMEOUT = 2
+T3CODE_WINDOW_DAYS = 364
+LEVEL_MAX = 4
+
 # Pruning (SPEC §6): besides the protected PNGs, keep up to RETAIN_EXTRA others rendered in
 # the last RETAIN_DAYS, so a Space you are not on rarely points at a deleted file (~32 KB each).
 RETAIN_DAYS = 14
@@ -115,6 +124,10 @@ log = logging.getLogger("gh-heatmap")
 
 class FetchError(Exception):
     """The response was unusable (wrong host after redirects, too large, odd status)."""
+
+
+class T3CodeError(Exception):
+    pass
 
 
 # --- Small helpers: logging, files, time -----------------------------------
@@ -205,6 +218,19 @@ def normalize_theme_name(name: Any) -> str | None:
 def resolve_theme(name: str | None) -> dict[str, Any]:
     """The validated colours for a normalized theme name (None = the default look)."""
     return validate_theme(DEFAULT_THEME if name is None else THEMES[name])
+
+
+def normalize_mode(name: Any) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ValueError(f"mode must be a string, not {name!r}")
+    key = name.lower()
+    if key == MODE_GITHUB:
+        return None
+    if key != MODE_T3CODE:
+        raise ValueError(f"unknown mode {name!r}; valid: {', '.join(MODES)}")
+    return key
 
 
 def parse_size(text: str, flag: str) -> int | None:
@@ -309,6 +335,65 @@ def layout(cells: dict[str, int]) -> tuple[dict[str, tuple[int, int]], int]:
         positions[text] = (days // 7, days % 7)
     ncols = max(col for col, _row in positions.values()) + 1
     return positions, ncols
+
+
+def t3code_window(today: dt.date) -> dt.date:
+    anchor = today - dt.timedelta(days=T3CODE_WINDOW_DAYS)
+    return anchor - dt.timedelta(days=(anchor.weekday() + 1) % 7)
+
+
+def read_t3code_timestamps(db: Path) -> list[Any]:
+    import sqlite3
+
+    if not db.is_file():
+        raise T3CodeError(f"T3 Code database not found at {db}")
+    try:
+        connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=T3CODE_DB_TIMEOUT)
+        try:
+            rows = connection.execute(T3CODE_QUERY).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise T3CodeError(f"could not read T3 Code's database ({db}): {exc}") from None
+    return [row[0] for row in rows]
+
+
+def daily_counts(timestamps: list[Any], start: dt.date, today: dt.date) -> dict[str, int]:
+    counts = {(start + dt.timedelta(days=offset)).isoformat(): 0 for offset in range((today - start).days + 1)}
+    for text in timestamps:
+        try:
+            moment = dt.datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            raise ValueError(f"bad T3 Code timestamp {text!r}") from None
+        if moment.utcoffset() is None:
+            raise ValueError(f"T3 Code timestamp without a UTC offset: {text!r}")
+        day = moment.astimezone().date().isoformat()
+        if day in counts:
+            counts[day] += 1
+    return counts
+
+
+def levels_from_counts(counts: dict[str, int], today: dt.date) -> dict[str, int]:
+    today_key = today.isoformat()
+    completed = sorted(runs for day, runs in counts.items() if runs > 0 and day != today_key)
+
+    def level(runs: int) -> int:
+        if runs <= 0:
+            return 0
+        if not completed:
+            return LEVEL_MAX
+        rank = bisect.bisect_left(completed, runs) + 1
+        return min(LEVEL_MAX, -(-LEVEL_MAX * rank // len(completed)))
+
+    return {day: level(runs) for day, runs in counts.items()}
+
+
+def t3code_cells(today: dt.date) -> dict[str, int]:
+    counts = daily_counts(read_t3code_timestamps(T3CODE_DB), t3code_window(today), today)
+    cells = validate_cells(levels_from_counts(counts, today), today)
+    log.info("t3code: %d runs on %d active days in the last %d days",
+             sum(counts.values()), sum(1 for runs in counts.values() if runs), len(counts))
+    return cells
 
 
 # --- Render (SPEC §7) ------------------------------------------------------
@@ -445,7 +530,7 @@ def get_cells(username: str, state: dict[str, Any], use_etag: bool = True) -> di
 
 # --- State (SPEC §6) -------------------------------------------------------
 
-def load_state(username: str) -> dict[str, Any]:
+def load_state(username: str | None) -> dict[str, Any]:
     """Read state.json (or start fresh), dropping cached data for a different user."""
     try:
         state = read_json(STATE_FILE)
@@ -454,14 +539,15 @@ def load_state(username: str) -> dict[str, Any]:
         state = None
     if not isinstance(state, dict):
         state = {}
-    if state.get("username") != username:
+    if username is not None and state.get("username") != username:
         for key in ("etag", "cells", "fetched_at"):
             state.pop(key, None)
     for key in ("applied", "applied_prev"):  # display id -> current / previous render hash
         if not isinstance(state.get(key), dict):
             state[key] = {}
     state.setdefault("retry_until", None)
-    state["username"] = username
+    if username is not None:
+        state["username"] = username
     state["version"] = STATE_VERSION
     return state
 
@@ -898,6 +984,10 @@ def saved_theme_name(config: dict[str, Any] | None) -> str | None:
     return normalize_theme_name(config.get("theme")) if config is not None else None
 
 
+def saved_mode(config: dict[str, Any] | None) -> str | None:
+    return normalize_mode(config.get("mode")) if config is not None else None
+
+
 def saved_size(config: dict[str, Any] | None, key: str) -> int | None:
     """The size saved under `key` ("width" / "height") in config.json; None if absent.
     ValueError if present but invalid (including null), never a silent fall back."""
@@ -911,6 +1001,8 @@ def setting_changes(args: argparse.Namespace) -> dict[str, Any]:
     changes: dict[str, Any] = {}
     if args.theme is not None:
         changes["theme"] = args.theme_name
+    if args.mode is not None:
+        changes["mode"] = args.mode_name
     for key in SIZE_KEYS:
         if getattr(args, key) is not None:
             changes[key] = getattr(args, f"{key}_pct")
@@ -918,16 +1010,17 @@ def setting_changes(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def save_settings(config: dict[str, Any] | None, changes: dict[str, Any]) -> None:
-    """Persist `--theme` / `--width` / `--height` in config.json, keeping every other key;
+    """Persist `--theme` / `--mode` / `--width` / `--height` in config.json, keeping every other key;
     a None value removes that key (back to the default). Call only under the lock."""
     if config is None or "username" not in config:
-        raise ValueError("not installed: run install.py --user NAME (it also takes --theme, --width "
-                         "and --height) instead")
+        raise ValueError("not installed: run install.py --user NAME (it also takes --theme, --mode, "
+                         "--width and --height) instead")
     validate_username(config["username"])
     updated = {key: value for key, value in config.items() if key not in changes}
     updated.update({key: value for key, value in changes.items() if value is not None})
     atomic_write_json(CONFIG_FILE, updated)
-    log.info("saved %s", ", ".join(f"{key}={RESET_THEME if value is None else value}"
+    defaults = {"mode": MODE_GITHUB}
+    log.info("saved %s", ", ".join(f"{key}={defaults.get(key, RESET_THEME) if value is None else value}"
                                    for key, value in changes.items()))
 
 
@@ -937,15 +1030,17 @@ def screens_available() -> bool:
     return bool(screens)
 
 
-def update(username: str, theme: dict[str, Any], box: tuple[int, int], force: bool, dry: bool) -> int:
-    """Fetch, then refresh stale screens (or, with dry=True, only write preview.png).
+def update(mode: str, username: str | None, theme: dict[str, Any], box: tuple[int, int], force: bool,
+           dry: bool) -> int:
+    """Get the cells (GitHub: fetch; t3code: read T3 Code's database), then refresh stale
+    screens (or, with dry=True, only write preview.png).
 
     force=True ignores the ETag and up-to-date checks and re-renders and re-applies on
-    every display, but still honours a recorded GitHub backoff and falls back to cached
-    data if the network fails.
+    every display. In GitHub mode it still honours a recorded GitHub backoff and falls
+    back to cached data if the network fails.
     """
     state = load_state(username)
-    if rate_limited(state):
+    if mode == MODE_GITHUB and rate_limited(state):
         if dry:
             log.error("dry run: no preview written: GitHub backoff until %s", state["retry_until"])
             return EXIT_ERROR
@@ -955,14 +1050,18 @@ def update(username: str, theme: dict[str, Any], box: tuple[int, int], force: bo
     if not dry and not screens_available():
         log.info("no screens available (login window or display asleep); nothing to do")
         return EXIT_SKIPPED
-    cells = get_cells(username, state, use_etag=not force)
-    if not dry:
-        atomic_write_json(STATE_FILE, state)  # persist etag / cells / retry_until
-    if cells is None:  # GitHub answered 429/503
-        if dry:
-            log.error("dry run: no preview written: GitHub asked us to back off")
-            return EXIT_ERROR
-        return EXIT_SKIPPED
+    if mode == MODE_T3CODE:
+        cells = t3code_cells(dt.date.today())
+    else:
+        github_cells = get_cells(username, state, use_etag=not force)
+        if not dry:
+            atomic_write_json(STATE_FILE, state)  # persist etag / cells / retry_until
+        if github_cells is None:  # GitHub answered 429/503
+            if dry:
+                log.error("dry run: no preview written: GitHub asked us to back off")
+                return EXIT_ERROR
+            return EXIT_SKIPPED
+        cells = github_cells
     if not dry:
         return apply_to_screens(cells, state, force, theme, box)
     from AppKit import NSScreen  # dry run: render at the main screen's size, touch nothing else
@@ -975,24 +1074,31 @@ def update(username: str, theme: dict[str, Any], box: tuple[int, int], force: bo
     return EXIT_OK
 
 
-def resolve_run(args: argparse.Namespace) -> tuple[str, dict[str, Any], tuple[int, int], dict[str, Any] | None]:
-    """Read config.json once and validate the username, theme and size for this run, before any
-    config, fetch or state write. A flag given on the command line replaces the saved value
-    (so `--width default` gets past an invalid saved width). Returns (username, theme
-    colours, size box, config)."""
+def resolve_run(args: argparse.Namespace) -> tuple[str, str | None, dict[str, Any], tuple[int, int],
+                                                    dict[str, Any] | None]:
+    """Read config.json once and validate the mode, username, theme and size for this run, before
+    any config, fetch or state write. A flag given on the command line replaces the saved value
+    (so `--width default` gets past an invalid saved width). Returns (mode, username or None in
+    t3code mode, theme colours, size box, config)."""
     config = load_config()
-    username = resolve_username(args.user, config)
+    mode = (args.mode_name if args.mode is not None else saved_mode(config)) or MODE_GITHUB
+    if mode == MODE_T3CODE:
+        if args.user is not None:
+            raise ValueError("--user has no effect in t3code mode (add --mode github to use it)")
+        username = None
+    else:
+        username = resolve_username(args.user, config)
     name = args.theme_name if args.theme is not None else saved_theme_name(config)
     width, height = (getattr(args, f"{key}_pct") if getattr(args, key) is not None else saved_size(config, key)
                      for key in SIZE_KEYS)
-    return username, resolve_theme(name), effective_box(width, height), config
+    return mode, username, resolve_theme(name), effective_box(width, height), config
 
 
 def run(args: argparse.Namespace) -> int:
     """Dispatch to the requested mode, holding the lock where state is touched."""
     if args.dry_run:  # writes only preview.png (and the log), so no lock is needed; saves nothing
-        username, theme, box, _config = resolve_run(args)
-        return update(username, theme, box, force=False, dry=True)
+        mode, username, theme, box, _config = resolve_run(args)
+        return update(mode, username, theme, box, force=False, dry=True)
     lock_fd = acquire_lock()
     if lock_fd is None:
         log.info("another run holds the lock; exiting")
@@ -1002,13 +1108,13 @@ def run(args: argparse.Namespace) -> int:
             return restore()
         if args.uninstall:
             return uninstall()
-        username, theme, box, config = resolve_run(args)
+        mode, username, theme, box, config = resolve_run(args)
         changes = setting_changes(args)
         if changes:
             # Saved before fetching: config.json records the choice, state.json's `applied`
             # records progress, so a skipped or failed run is completed by a later one.
             save_settings(config, changes)
-        code = update(username, theme, box, force=args.force, dry=False)
+        code = update(mode, username, theme, box, force=args.force, dry=False)
         if changes and code == EXIT_SKIPPED:
             log.info("settings saved; they will be applied on the next successful run")
         return code
@@ -1026,8 +1132,12 @@ class ArgumentParser(argparse.ArgumentParser):
 
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments, run, and turn any error into one log line and exit code 1."""
-    parser = ArgumentParser(description="GitHub contribution graph as your macOS wallpaper.")
-    parser.add_argument("--user", metavar="NAME", help="override the username in config.json")
+    parser = ArgumentParser(description="GitHub contribution graph (or T3 Code usage) as your macOS wallpaper.")
+    parser.add_argument("--user", metavar="NAME", help="override the username in config.json (GitHub mode only)")
+    parser.add_argument("--mode", metavar="NAME",
+                        help="where the squares come from: 'github' (the default: your contribution graph) or "
+                             "'t3code' (T3 Code runs per day, read from its local database); saved and applied "
+                             "like --theme")
     parser.add_argument("--theme", metavar="NAME",
                         help="change the colour theme: saved to config.json and applied now; with "
                              "--dry-run, only previewed; 'default' is the green look (see --list-themes)")
@@ -1056,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
             setattr(args, f"{key}_pct", parse_size(value, f"--{key}") if value is not None else None)
         except ValueError as exc:
             parser.error(str(exc))
-    given = [f"--{key}" for key in ("theme", *SIZE_KEYS) if getattr(args, key) is not None]
+    given = [f"--{key}" for key in ("theme", "mode", *SIZE_KEYS) if getattr(args, key) is not None]
     if given and (args.restore or args.uninstall or args.list_themes):
         parser.error(f"{', '.join(given)} cannot be used with --restore, --uninstall or --list-themes")
     if args.list_themes:
@@ -1065,6 +1175,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.theme is not None:
         try:
             args.theme_name = normalize_theme_name(args.theme)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.mode is not None:
+        try:
+            args.mode_name = normalize_mode(args.mode)
         except ValueError as exc:
             parser.error(str(exc))
     setup_logging()
