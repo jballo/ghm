@@ -13,7 +13,7 @@ Design contract: [SPEC.md](SPEC.md).
 Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
 
 ```sh
-python3 install.py --user YOUR_GITHUB_NAME     # optional: --mode t3code, --theme nord, --width 40%, --interval 600
+python3 install.py --user YOUR_GITHUB_NAME     # optional: --mode t3code, --theme nord, --width 40%, --watch-spaces
 python3 uninstall.py
 ```
 
@@ -123,6 +123,7 @@ means `--restore`/`--uninstall` found the lock busy.
 ~/Library/Logs/gh-heatmap.log               (plus rotated .1-.3, 512 KiB each)
 ~/Library/Logs/gh-heatmap.launchd.log       launchd stdout/stderr; should stay empty
 ~/Library/LaunchAgents/local.gh-heatmap.plist
+~/Library/LaunchAgents/local.gh-heatmap.spaces.plist   only with --watch-spaces
 ```
 
 Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edits.
@@ -141,6 +142,17 @@ any reader of that database does; the database itself is never changed.
   Recent PNGs (up to 50 rendered in the last 14 days, ~32 KB each) are kept so those
   Spaces still have their file; one left alone longer may point at a deleted image
   until a run happens on it.
+- **Optional: update a Space as you switch to it.** `install.py --watch-spaces` adds a
+  small process that stays running (about 85 MB of memory, no CPU while idle). When you
+  switch Spaces, macOS tells it, and it re-applies the graph the last scheduled run applied
+  (GitHub or T3 Code, with your saved theme and size), usually within a few ms, with no
+  network request and without opening T3 Code's database. You still see the old image during the swipe
+  and a short macOS fade to the new one: macOS only says you switched once you've
+  arrived. Spaces you don't visit still keep their old image.
+  Turn it off with `install.py --user YOUR_GITHUB_NAME --no-watch-spaces`; a reinstall
+  without either flag keeps your choice.
+- **"Show on all Spaces" gets turned off.** macOS switches that Wallpaper setting off
+  whenever an app sets the wallpaper, so each update applies per Space (see SPEC §13).
 - **Uninstall restores the Spaces you are on.** Other Spaces can still point at a
   deleted heatmap afterwards; open each one and pick a wallpaper in System Settings.
 - Restore is best-effort for static images. A dynamic wallpaper, a slideshow or a
@@ -168,14 +180,15 @@ is kept. It also keeps your saved mode, theme and size unless you pass `--mode`,
 
 - All the logic is in `heatmap.py`, one file that imports only the standard
   library plus Pillow (for drawing) and PyObjC's AppKit/Foundation (for setting the
-  wallpaper). It makes no subprocess calls. Its only network request is the one GET above,
+  wallpaper and, with `--watch-spaces`, hearing about Space changes). It uses only
+  public Apple API. It makes no subprocess calls. Its only network request is the one GET above,
   and it refuses any redirect off `https://github.com/`.
 - In T3 Code mode it makes no network request. It opens `~/.t3/userdata/statev2.sqlite`
   with the standard library's `sqlite3` in read-only mode (`?mode=ro`), runs one query for
   the `requested_at` column of `orchestration_v2_projection_runs`, and closes it. It never
   reads message text, titles or anything else in that database.
 - `install.py` and `uninstall.py` are standard-library only. Their only subprocess
-  calls are `uv sync --locked`, `/bin/launchctl bootout|bootstrap`, and
+  calls are `uv sync --locked`, `/bin/launchctl bootout|bootstrap` (for one or two agents), and
   `.venv/bin/python heatmap.py [--uninstall]`. `uninstall.py` deletes only the plist; the support dir and logs are deleted only by `heatmap.py --uninstall`.
 - Dependencies are `pillow` and `pyobjc-framework-Cocoa` (which pulls in `pyobjc-core`).
   `uv.lock` pins every wheel with a sha256 hash, and `uv sync --locked` refuses to run
