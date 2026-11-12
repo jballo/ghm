@@ -2,10 +2,13 @@
 """Install gh-heatmap for the current user (SPEC §10).
 
 Usage: python3 install.py --user NAME [--mode NAME] [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
+                          [--watch-spaces | --no-watch-spaces]
 
 Runs `uv sync --locked`, writes config.json (keeping a saved mode, theme and size unless the flag is given),
 does one run by hand (which must succeed
-and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. Everything lives under $HOME; no sudo. Uses only the
+and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. With --watch-spaces it
+also loads a second, resident agent that re-applies the graph when you switch Spaces (SPEC §13).
+Everything lives under $HOME; no sudo. Uses only the
 standard library so it runs on any Python 3.9+ (including macOS's /usr/bin/python3).
 """
 
@@ -47,6 +50,8 @@ STATE_FILE = SUPPORT_DIR / "state.json"
 BACKUP_FILE = SUPPORT_DIR / "backup.json"
 LOCK_FILE = SUPPORT_DIR.parent / "gh-heatmap.lock"   # heatmap.py's lock; outside SUPPORT_DIR
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+WATCH_LABEL = "local.gh-heatmap.spaces"   # opt-in Space watcher (SPEC §13); uninstall.py matches
+WATCH_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{WATCH_LABEL}.plist"
 LAUNCHD_LOG = Path.home() / "Library" / "Logs" / "gh-heatmap.launchd.log"
 LAUNCHCTL = "/bin/launchctl"
 LOCK_ATTEMPTS = 15   # ...retried every LOCK_RETRY_SECONDS, about 30 s in total (as uninstall.py)
@@ -191,6 +196,44 @@ class ArgumentParser(argparse.ArgumentParser):
         self.exit(1, f"{self.prog}: error: {message}\n")
 
 
+def build_watch_plist() -> dict:
+    """The opt-in Space watcher: resident, restarted by launchd only if it crashes."""
+    return {
+        "Label": WATCH_LABEL,
+        "ProgramArguments": [str(VENV_PYTHON), str(HEATMAP), "--watch-spaces"],
+        "WorkingDirectory": str(PROJECT_DIR),
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin"},
+        "RunAtLoad": True,
+        # It exits 0 on purpose when uninstalled (no config.json): don't restart that.
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,   # at most one restart a minute if it keeps crashing
+        "StandardOutPath": str(LAUNCHD_LOG),
+        "StandardErrorPath": str(LAUNCHD_LOG),
+    }
+
+
+def is_loaded(domain: str, label: str) -> bool:
+    """True if launchd still has the job (`launchctl print` succeeds only for a loaded job)."""
+    return subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], check=False,
+                          capture_output=True).returncode == 0
+
+
+def remove_watcher(domain: str) -> None:
+    """Stop the Space watcher and delete its plist; exit if it is still loaded afterwards.
+
+    bootout fails harmlessly when the job isn't loaded, so its exit code alone can't tell
+    "already gone" from "failed to stop"; `launchctl print` decides. The plist is kept if the
+    job is still loaded, so the state stays visible and a re-run can try again.
+    """
+    subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+    if is_loaded(domain, WATCH_LABEL):
+        sys.exit(f"could not stop {WATCH_LABEL} (still loaded); try `launchctl bootout "
+                 f"{domain}/{WATCH_LABEL}`, then run install.py again")
+    if WATCH_PLIST_PATH.exists():
+        WATCH_PLIST_PATH.unlink()
+        print(f"==> stopped {WATCH_LABEL} and removed {WATCH_PLIST_PATH}")
+
+
 def main() -> int:
     """Run the install steps in order; stop at the first failure."""
     parser = ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
@@ -208,6 +251,9 @@ def main() -> int:
                         help="largest grid height as a percentage of the screen (10%%-100%%), or "
                              f"{RESET_SIZE}. Omitted: keep the saved height on a reinstall, else default")
     parser.add_argument("--interval", type=int, default=600, help="seconds between runs (default 600)")
+    parser.add_argument("--watch-spaces", action=argparse.BooleanOptionalAction, default=None,
+                        help="also run a small resident process that re-applies the graph when you "
+                             "switch Spaces (SPEC §13). Omitted: keep whatever a previous install chose")
     args = parser.parse_args()
 
     # 1. Validate inputs and find uv.
@@ -231,6 +277,12 @@ def main() -> int:
     uv = shutil.which("uv")
     if uv is None:
         sys.exit("uv not found on PATH; install it first (https://docs.astral.sh/uv/)")
+
+    # 1a. --no-watch-spaces is honoured first, so turning the watcher off never depends on
+    #     the steps below (uv sync, the first run, GitHub, the main agent) succeeding.
+    domain = f"gui/{os.getuid()}"
+    if args.watch_spaces is False:
+        remove_watcher(domain)
 
     # 2. Install exactly the hash-pinned wheels from uv.lock. --locked fails if uv.lock is
     #    missing or out of date with pyproject.toml (--frozen would silently accept a stale lock).
@@ -272,13 +324,31 @@ def main() -> int:
     print(f"==> wrote {PLIST_PATH}")
 
     # 6. (Re)load it: bootout may fail if it was not loaded, which is fine.
-    domain = f"gui/{os.getuid()}"
     subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{LABEL}"], check=False, capture_output=True)
     subprocess.run([LAUNCHCTL, "bootstrap", domain, str(PLIST_PATH)], check=True)
+
+    # 6a. The opt-in Space watcher: on with --watch-spaces; with no flag, as a previous
+    #     install left it (its plist exists or not); --no-watch-spaces was handled in 1a.
+    watch = WATCH_PLIST_PATH.exists() if args.watch_spaces is None else args.watch_spaces
+    if watch:
+        subprocess.run([LAUNCHCTL, "bootout", f"{domain}/{WATCH_LABEL}"], check=False, capture_output=True)
+        if is_loaded(domain, WATCH_LABEL):  # the old one didn't stop: don't touch its plist
+            sys.exit(f"{LABEL} is installed, but the running {WATCH_LABEL} could not be stopped "
+                     f"to reload it; try `launchctl bootout {domain}/{WATCH_LABEL}`, then run install.py again")
+        atomic_write_bytes(WATCH_PLIST_PATH, plistlib.dumps(build_watch_plist()))
+        loaded = subprocess.run([LAUNCHCTL, "bootstrap", domain, str(WATCH_PLIST_PATH)], check=False)
+        if loaded.returncode != 0:
+            WATCH_PLIST_PATH.unlink(missing_ok=True)
+            sys.exit(f"{LABEL} is installed, but loading {WATCH_LABEL} failed "
+                     f"(launchctl exit {loaded.returncode}); the Space watcher is not installed")
+        print(f"==> wrote and loaded {WATCH_PLIST_PATH}")
 
     # 7. Report.
     source = "showing T3 Code usage" if t3code else f"for GitHub user {args.user}"
     print(f"\nInstalled {LABEL}: runs every {args.interval} s {source} ({describe(config)}).")
+    if watch:
+        print(f"Installed {WATCH_LABEL}: re-applies the graph when you switch Spaces "
+              f"(turn off: python3 install.py --user {args.user} --no-watch-spaces).")
     other = MODE_GITHUB if t3code else MODE_T3CODE
     print(f"  mode:      cd {PROJECT_DIR} && uv run heatmap.py --mode {other}   (--mode {MODE_GITHUB} or {MODE_T3CODE})")
     print(f"  theme:     cd {PROJECT_DIR} && uv run heatmap.py --theme NAME   (--list-themes for names)")

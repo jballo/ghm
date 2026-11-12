@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """gh-heatmap: your public GitHub contribution graph as your macOS wallpaper (see SPEC.md).
 
-Each run: fetch -> parse -> render -> set wallpaper -> exit. Only the standard library is
+Each run: fetch -> parse -> render -> set wallpaper -> exit. The one exception is the opt-in
+`--watch-spaces` mode (SPEC §13), which stays running and re-applies cached data whenever the
+active Space changes, without any network request. Only the standard library is
 imported at module level; Pillow and AppKit/Foundation are imported inside the functions
 that need them, so `--restore` and `--uninstall` never import Pillow.
 
@@ -12,7 +14,7 @@ and the check then passes.
 
 Exit codes (SPEC §3):
   0  success: applied or already up to date on every screen; --restore restored everything;
-     --uninstall deleted everything
+     --uninstall deleted everything; --watch-spaces stopped, or found nothing installed
   1  error, including: --dry-run wrote no preview; --restore could not restore every screen;
      --uninstall kept the files because a screen still shows our image; an unknown theme;
      an invalid size (given or saved); any command-line usage error
@@ -701,17 +703,20 @@ def load_backup() -> list[dict[str, Any]] | None:
 def ensure_backup(workspace: Any, screens: list[Any], state: dict[str, Any]) -> None:
     """Add the original wallpaper of each connected screen not yet in backup.json (SPEC §9).
 
-    Existing entries are never modified (reinstalls keep the real original). Screens
-    already showing one of our PNGs are skipped. Raises if a screen can't be read or
-    backup.json is invalid; the caller then changes nothing.
+    Existing entries are never modified (reinstalls keep the real original), and a display
+    already in backup.json is not read at all. Screens already showing one of our PNGs are
+    skipped. Raises if a display not yet backed up can't be read, or backup.json is invalid;
+    the caller then changes nothing.
     """
     entries = load_backup() or []
     known = {entry["display"] for entry in entries}
     added = []
     for screen in screens:
         did = display_id(screen)
+        if did in known:
+            continue  # checked first: right after a Space change, reading the path can take ~50 ms
         path = wallpaper_path(workspace, screen)
-        if did in known or (path is not None and is_ours(path)):
+        if path is not None and is_ours(path):
             continue
         options = json_safe_options(workspace.desktopImageOptionsForScreen_(screen))
         added.append({"display": did, "path": path, "options": options})
@@ -774,14 +779,25 @@ def prune(state: dict[str, Any], live_before: list[str] | None) -> None:
         log.info("pruned %s", png.name)
 
 
+_UNREAD = object()  # apply_to_screen: "current path not read yet" (None means "no wallpaper")
+
+
 def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: dict[str, Any],
-                    force: bool, theme: dict[str, Any], box: tuple[int, int]) -> None:
-    """Render (if needed) and set one screen's wallpaper, then record it; raise on failure."""
+                    force: bool, theme: dict[str, Any], box: tuple[int, int], settle: bool = True,
+                    current: Any = _UNREAD) -> None:
+    """Render (if needed) and set one screen's wallpaper, then record it; raise on failure.
+
+    settle=False skips the post-set read-back wait (the watcher, SPEC §13: it must not block
+    the next Space change for up to APPLY_WAIT_SECONDS, and no run follows it seconds later).
+    `current` is the screen's wallpaper path if the caller already read it this run, so it
+    isn't asked for twice (each read can take ~50 ms right after a Space change).
+    """
     key = str(display_id(screen))
     width, height = backing_size(screen)
     digest = render_hash(cells, width, height, theme, box)
     png = SUPPORT_DIR / f"heatmap-{digest}.png"
-    current = wallpaper_path(workspace, screen)
+    if current is _UNREAD:
+        current = wallpaper_path(workspace, screen)
     up_to_date = (state["applied"].get(key) == digest and png.exists() and current is not None
                   and os.path.realpath(current) == os.path.realpath(png))
     if up_to_date and not force:
@@ -797,6 +813,8 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
     state["applied"][key] = digest
     atomic_write_json(STATE_FILE, state)
     log.info("display %s: set %s (%dx%d)", key, png.name, width, height)
+    if not settle:
+        return
     # Give macOS a moment to report the new path, so a run seconds later sees it as up to date.
     # The set already succeeded and is recorded, so a failure here is only worth a log line.
     try:
@@ -807,7 +825,7 @@ def apply_to_screen(workspace: Any, screen: Any, cells: dict[str, int], state: d
 
 
 def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, theme: dict[str, Any],
-                     box: tuple[int, int]) -> int:
+                     box: tuple[int, int], settle: bool = True) -> int:
     """Update every screen that needs it; return EXIT_OK, EXIT_ERROR or EXIT_SKIPPED."""
     screens, workspace = screens_and_workspace()
     if not screens:
@@ -818,15 +836,20 @@ def apply_to_screens(cells: dict[str, int], state: dict[str, Any], force: bool, 
     except Exception as exc:
         log.error("could not save the original wallpapers (%s: %s); changing nothing", type(exc).__name__, exc)
         return EXIT_ERROR
-    try:
-        live_before: list[str] | None = [p for p in (wallpaper_path(workspace, s) for s in screens) if p]
+    try:  # one read per screen, used both for prune's snapshot and for the up-to-date check
+        before: list[Any] = [wallpaper_path(workspace, s) for s in screens]
+        live_before: list[str] | None = [p for p in before if p]
     except Exception as exc:
         log.warning("could not read current wallpapers (%s)", exc)
+        before = [_UNREAD] * len(screens)
         live_before = None
     failed = False
     for index, screen in enumerate(screens):
+        # Reuse the snapshot read only while it is fresh: with settle=True each earlier set
+        # can wait up to APPLY_WAIT_SECONDS, during which this screen's Space may change.
+        current = before[index] if (not settle or index == 0) else _UNREAD
         try:
-            apply_to_screen(workspace, screen, cells, state, force, theme, box)
+            apply_to_screen(workspace, screen, cells, state, force, theme, box, settle, current)
         except Exception as exc:  # this screen's state stays unchanged; carry on with the others
             log.error("screen #%d: %s: %s", index, type(exc).__name__, exc)
             failed = True
@@ -957,6 +980,288 @@ def uninstall() -> int:
         return EXIT_ERROR
     print(f"Deleted {SUPPORT_DIR} and ~/Library/Logs/gh-heatmap*.log* "
           f"(kept the empty lock file {LOCK_FILE})")
+    return EXIT_OK
+
+
+# --- Space watcher (SPEC §13; opt-in, the only resident mode) -------------
+
+WATCH_RETRY_SECONDS = 5.0        # lock busy: try again this much later...
+WATCH_RETRY_ATTEMPTS = 12        # ...this many times (about a minute), then wait for the next change
+REFRESH_DONE, REFRESH_RETRY, REFRESH_STOP = "done", "retry", "stop"
+
+
+class WatchCache:
+    """What a watcher refresh needs, kept between Space changes (SPEC §13).
+
+    The lock file stays open (only flock/unflock per refresh). Config, theme, state and
+    validated cells are reloaded only when config.json, state.json or backup.json change
+    (checked by inode, mtime and size: microseconds) or the date changes.
+    """
+
+    def __init__(self) -> None:
+        self.lock_fd: int | None = None
+        self.key: Any = None
+        self.theme: dict[str, Any] = {}
+        self.box: tuple[int, int] = DEFAULT_BOX
+        self.state: dict[str, Any] = {}
+        self.cells: dict[str, int] | None = None
+        self.backed_up: set[int] = set()
+        self.digests: dict[tuple[int, int, int], str] = {}
+
+    @staticmethod
+    def files_key() -> Any:
+        parts = []
+        for path in (CONFIG_FILE, STATE_FILE, BACKUP_FILE):
+            try:
+                st = os.stat(path)
+                parts.append((st.st_ino, st.st_mtime_ns, st.st_size))
+            except FileNotFoundError:
+                parts.append(None)
+        return tuple(parts), dt.date.today()
+
+    def lock(self) -> bool:
+        """Take the lock without blocking; False if another run holds it."""
+        if self.lock_fd is None:
+            LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def unlock(self) -> None:
+        if self.lock_fd is not None:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+
+    def close(self) -> None:
+        """Close the lock file (releasing any lock held through it)."""
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
+    def reload(self, config: dict[str, Any]) -> None:
+        mode = saved_mode(config) or MODE_GITHUB
+        self.theme = resolve_theme(saved_theme_name(config))
+        self.box = effective_box(*(saved_size(config, key) for key in SIZE_KEYS))
+        if mode == MODE_T3CODE:
+            self.state = load_state(None)
+            self.cells = t3code_cells(dt.date.today())
+        else:
+            self.state = load_state(resolve_username(None, config))
+            cached = self.state.get("cells")
+            self.cells = validate_cells(cached, dt.date.today()) if cached else None
+        self.backed_up = {entry["display"] for entry in (load_backup() or [])}
+        self.digests = {}
+
+    def quick_targets(self, screens: list[Any]) -> list[tuple[Any, str]] | None:
+        """(screen, PNG) for every screen if the quick path applies, else None.
+
+        Applies when each display is already in backup.json, state.json says it shows the
+        PNG for the current cells/size/theme, and that PNG exists: then setting it needs no
+        render, no backup and no state change, so it can be set without first asking macOS
+        what the Space shows (that read can take ~2-8 ms right after a switch).
+        """
+        targets = []
+        for screen in screens:
+            did = display_id(screen)
+            width, height = backing_size(screen)
+            if did not in self.backed_up:
+                return None
+            digest = self.digests.get((did, width, height))
+            if digest is None:
+                digest = self.digests[(did, width, height)] = render_hash(self.cells, width, height, self.theme,
+                                                                          self.box)
+            png = SUPPORT_DIR / f"heatmap-{digest}.png"
+            if self.state["applied"].get(str(did)) != digest or not png.exists():
+                return None
+            targets.append((screen, str(png)))
+        return targets
+
+
+def refresh_from_cache(cache: WatchCache | None = None) -> str:
+    """Re-apply the cached graph to every screen's current Space; never makes a network request.
+
+    Takes the lock for the duration. Returns REFRESH_RETRY if another run holds it,
+    REFRESH_STOP if config.json is gone (uninstalled), else REFRESH_DONE. Errors are logged,
+    never raised (lock errors included), so one bad refresh can't stop the watcher.
+
+    Quick path (the usual case): set each screen's recorded PNG straight away, even if the
+    Space already shows it. Otherwise the normal apply path (§6), which reads first.
+    """
+    owned = cache is None
+    cache = cache if cache is not None else WatchCache()
+    locked = False
+    try:
+        if not cache.lock():
+            return REFRESH_RETRY
+        locked = True
+        key = cache.files_key()
+        if key[0][0] is None:
+            log.info("watch: config.json is gone (uninstalled?); stopping")
+            return REFRESH_STOP
+        if key != cache.key:
+            config = load_config()
+            if config is None:
+                log.info("watch: config.json is gone (uninstalled?); stopping")
+                return REFRESH_STOP
+            cache.key = None  # stays invalid if reload fails
+            cache.reload(config)
+            cache.key = key
+        if not cache.cells:
+            log.info("watch: no cached graph yet; the next scheduled run will set it")
+            return REFRESH_DONE
+        screens, workspace = screens_and_workspace()
+        targets = None
+        if screens:
+            try:
+                targets = cache.quick_targets(screens)
+            except Exception as exc:  # noqa: BLE001 - the normal path isolates each display
+                log.warning("watch: quick path unavailable (%s: %s)", type(exc).__name__, exc)
+        if targets is not None:
+            done = []
+            for index, (screen, png) in enumerate(targets):
+                try:  # each display on its own, as in §6: one failing can't block the others
+                    set_wallpaper(workspace, screen, png, {})
+                    done.append(os.path.basename(png))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("watch: screen #%d: %s: %s", index, type(exc).__name__, exc)
+            if done:
+                log.info("watch: set %s", ", ".join(done))
+            return REFRESH_DONE
+        apply_to_screens(cache.cells, cache.state, force=False, theme=cache.theme, box=cache.box, settle=False)
+        cache.key = None  # apply may have written state.json / backup.json: reload next time
+        return REFRESH_DONE
+    except Exception as exc:  # noqa: BLE001 - logged; the watcher keeps running
+        log.error("watch: refresh failed: %s: %s", type(exc).__name__, exc)
+        cache.key = None
+        return REFRESH_DONE
+    finally:
+        if locked:
+            try:
+                cache.unlock()
+            except OSError as exc:
+                log.error("watch: could not release the lock: %s", exc)
+        if owned:
+            cache.close()
+
+
+class SpaceRefresher:
+    """Refreshes at once on each Space change; retries later while the lock is busy.
+
+    The refresh runs inside the notification callback, with no timer: macOS already reports
+    the new Space's wallpaper by then (measured on macOS 27.2), and a refresh whose PNG exists
+    takes a few ms, so waiting would only add delay. A change that arrives while a refresh is
+    running (if the notification is delivered re-entrantly) is not run nested, which would
+    share and release the lock early; it marks one more refresh to run right after. A new
+    change cancels a pending retry. `schedule(delay, fn)` runs fn on the main thread after `delay` seconds;
+    `refresh()` returns a REFRESH_* value; `stop()` ends the event loop. Free of AppKit, so it
+    can be tested.
+    """
+
+    def __init__(self, schedule: Callable[[float, Callable[[], None]], None],
+                 refresh: Callable[[], str], stop: Callable[[], None]) -> None:
+        self.schedule, self.refresh, self.stop = schedule, refresh, stop
+        self.generation = 0      # bumped by every change; a retry from an older one does nothing
+        self.attempts = 0
+        self.running = False     # a refresh is in progress
+        self.again = False       # a change arrived during it: refresh once more afterwards
+
+    def space_changed(self) -> None:
+        self.generation += 1
+        self.attempts = 0
+        if self.running:
+            self.again = True
+            return
+        self._run()
+
+    def _retry(self, generation: int) -> None:
+        if generation != self.generation:
+            return
+        if self.running:
+            self.again = True
+            return
+        self._run()
+
+    def _run(self) -> None:
+        self.running = True
+        try:
+            while True:
+                self.again = False
+                result = self.refresh()
+                if result == REFRESH_STOP:
+                    self.stop()
+                    return
+                if result == REFRESH_RETRY:  # a later retry covers any change marked meanwhile
+                    self.attempts += 1
+                    if self.attempts < WATCH_RETRY_ATTEMPTS:
+                        generation = self.generation
+                        self.schedule(WATCH_RETRY_SECONDS, lambda: self._retry(generation))
+                    else:
+                        log.warning("watch: lock stayed busy; waiting for the next Space change")
+                        self.attempts = 0
+                    return
+                self.attempts = 0
+                if not self.again:
+                    return
+        finally:
+            self.running = False
+
+
+def watch_spaces() -> int:
+    """Stay resident; after each active-Space change, refresh from cache (SPEC §13).
+
+    Uses only public AppKit API: NSWorkspace's NSWorkspaceActiveSpaceDidChangeNotification.
+    Exits 0 when not installed (no config.json) or when asked to stop (SIGTERM from launchctl
+    bootout, SIGINT), so launchd's KeepAlive {SuccessfulExit: false} does not restart it.
+    Exits 1 if the event loop ends on its own, so launchd does restart it.
+    """
+    if load_config() is None:
+        log.info("watch: not installed (no config.json); exiting")
+        return EXIT_OK
+    import signal
+
+    from AppKit import (NSApplication, NSApplicationActivationPolicyProhibited, NSEvent,
+                        NSEventTypeApplicationDefined, NSWorkspace,
+                        NSWorkspaceActiveSpaceDidChangeNotification)
+    from PyObjCTools import AppHelper, MachSignals
+
+    # macOS delivers the Space-change notification only to a process running NSApplication's
+    # own event loop (tested on macOS 27.2: a plain NSRunLoop, as PyObjC's runConsoleEventLoop
+    # gives, receives other NSWorkspace notifications but never this one). Prohibited policy:
+    # no Dock icon, no menu bar, never activated.
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+    stopping = False
+
+    def stop() -> None:
+        """Make app.run() return (terminate_ would exit() without cleanup)."""
+        nonlocal stopping
+        stopping = True
+        app.stop_(None)
+        # stop_ takes effect after the next event, so post one to wake the loop now.
+        app.postEvent_atStart_(NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            NSEventTypeApplicationDefined, (0, 0), 0, 0, 0, None, 0, 0, 0), True)
+
+    # Delivered through a mach port on the run loop, so the handler runs between refreshes
+    # (a refresh in progress finishes first) and wakes the idle loop at once.
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        MachSignals.signal(signum, lambda _signum: stop())
+    cache = WatchCache()
+    refresher = SpaceRefresher(schedule=lambda delay, fn: AppHelper.callLater(delay, fn),
+                               refresh=lambda: refresh_from_cache(cache), stop=stop)
+    center = NSWorkspace.sharedWorkspace().notificationCenter()
+    token = center.addObserverForName_object_queue_usingBlock_(
+        NSWorkspaceActiveSpaceDidChangeNotification, None, None, lambda _note: refresher.space_changed())
+    log.info("watch: watching for Space changes (pid %d)", os.getpid())
+    try:
+        app.run()  # sleeps until a notification, timer, signal or event arrives
+    finally:
+        center.removeObserver_(token)
+    if not stopping:
+        log.error("watch: event loop ended unexpectedly; exiting so launchd restarts it")
+        return EXIT_ERROR
+    log.info("watch: stopped")
     return EXIT_OK
 
 
@@ -1099,6 +1404,8 @@ def run(args: argparse.Namespace) -> int:
     if args.dry_run:  # writes only preview.png (and the log), so no lock is needed; saves nothing
         mode, username, theme, box, _config = resolve_run(args)
         return update(mode, username, theme, box, force=False, dry=True)
+    if args.watch_spaces:  # resident; takes the lock only around each refresh
+        return watch_spaces()
     lock_fd = acquire_lock()
     if lock_fd is None:
         log.info("another run holds the lock; exiting")
@@ -1158,6 +1465,9 @@ def main(argv: list[str] | None = None) -> int:
                       help="restore, verify no screen shows our image, then delete all our files "
                            "(used by uninstall.py)")
     mode.add_argument("--list-themes", action="store_true", help="print the built-in theme names and exit")
+    mode.add_argument("--watch-spaces", action="store_true",
+                      help="stay running and re-apply the cached graph whenever the active Space "
+                           "changes; no network requests (install.py --watch-spaces sets this up)")
     args = parser.parse_args(argv)
     # Checked before logging starts, so these touch no files at all.
     for key in SIZE_KEYS:
@@ -1169,6 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
     given = [f"--{key}" for key in ("theme", "mode", *SIZE_KEYS) if getattr(args, key) is not None]
     if given and (args.restore or args.uninstall or args.list_themes):
         parser.error(f"{', '.join(given)} cannot be used with --restore, --uninstall or --list-themes")
+    if args.watch_spaces and (args.user is not None or given):
+        parser.error("--watch-spaces takes no other options; it uses config.json")
     if args.list_themes:
         print("\n".join(sorted(THEMES)))
         return EXIT_OK
