@@ -2,7 +2,7 @@
 
 Your public GitHub contribution graph as your macOS desktop wallpaper: green squares on
 black by default, or one of five built-in themes, refreshed every 10 minutes by a per-user
-launchd job.
+launchd job. Or, with `--mode t3code`, your T3 Code usage instead (see below).
 No GitHub token; it reads only `https://github.com/users/<username>/contributions`.
 Design contract: [SPEC.md](SPEC.md).
 
@@ -13,7 +13,7 @@ Design contract: [SPEC.md](SPEC.md).
 Requires [uv](https://docs.astral.sh/uv/) on your `PATH`.
 
 ```sh
-python3 install.py --user YOUR_GITHUB_NAME     # optional: --theme nord, --width 40%, --interval 600
+python3 install.py --user YOUR_GITHUB_NAME     # optional: --mode t3code, --theme nord, --width 40%, --interval 600
 python3 uninstall.py
 ```
 
@@ -76,12 +76,41 @@ default: `--height 25%` hits the screen's width first and runs nearly edge to ed
 20% tall on a 16:10 screen); pair it with `--width` to keep it smaller. Like the theme, the size is saved in `config.json`, applies to every display
 in proportion to its own size, and is kept on a reinstall unless you pass the flag again.
 
+## T3 Code mode
+
+Instead of GitHub contributions, the squares can show how much you used T3 Code: one square
+per day, coloured by how many runs (turns sent to an agent) started that day.
+
+```sh
+uv run heatmap.py --dry-run --mode t3code       # preview only; saves nothing; needs no install
+uv run heatmap.py --mode t3code                 # save it and apply it now
+uv run heatmap.py --mode github                 # back to your GitHub graph
+```
+
+It reads T3 Code's local database, `~/.t3/userdata/statev2.sqlite`, read-only, and makes no
+network request. Only the start time of each run is read, never what was said. A square's
+colour is relative to your own busier and quieter days in the last year: roughly a quarter
+of the days you used T3 Code land on each of the four colours. Themes, sizes and the saved
+setting work exactly as in GitHub mode.
+
+Good to know:
+
+- The database layout belongs to T3 Code and can change in any update. If it does, this
+  mode logs an error and leaves your wallpaper as it was until `heatmap.py` is updated;
+  GitHub mode is unaffected.
+- History starts when T3 Code started keeping it; earlier days are empty.
+- Every run counts, including runs by subagents, delegated tasks and scheduled tasks.
+- `--user` has no effect in this mode and is an error; `install.py` still asks for it.
+
+Not affiliated with or endorsed by T3 Tools.
+
 ## Other flags
 
 `--force` (skip the ETag and up-to-date checks and re-render on every display;
 it still respects a GitHub backoff and still falls back to cached data when offline) and
 `--restore` (put the saved wallpaper back; deletes nothing). Exit codes: 0 means OK,
-1 means error (including an unknown theme, a bad size or a bad flag), 2 means skipped (no screens, backoff, or another run in progress), and 3
+1 means error (including an unknown theme or mode, a bad size, a bad flag, or T3 Code's
+database missing or unreadable), 2 means skipped (no screens, backoff, or another run in progress), and 3
 means `--restore`/`--uninstall` found the lock busy.
 
 ## Files it creates
@@ -97,6 +126,9 @@ means `--restore`/`--uninstall` found the lock busy.
 ```
 
 Plus `.venv/` in this folder. Nothing outside `$HOME`, no sudo, no shell-rc edits.
+In T3 Code mode, reading T3 Code's database can also create or update SQLite's own
+`statev2.sqlite-shm` / `-wal` files next to it (for example when T3 Code isn't running), as
+any reader of that database does; the database itself is never changed.
 
 ## Limitations
 
@@ -129,8 +161,8 @@ python3 install.py --user YOUR_GITHUB_NAME
 ```
 
 A reinstall never overwrites an existing `backup.json`, so your real original wallpaper
-is kept. It also keeps your saved theme and size unless you pass `--theme`, `--width` or
-`--height`.
+is kept. It also keeps your saved mode, theme and size unless you pass `--mode`, `--theme`,
+`--width` or `--height`.
 
 ## Auditing
 
@@ -138,6 +170,10 @@ is kept. It also keeps your saved theme and size unless you pass `--theme`, `--w
   library plus Pillow (for drawing) and PyObjC's AppKit/Foundation (for setting the
   wallpaper). It makes no subprocess calls. Its only network request is the one GET above,
   and it refuses any redirect off `https://github.com/`.
+- In T3 Code mode it makes no network request. It opens `~/.t3/userdata/statev2.sqlite`
+  with the standard library's `sqlite3` in read-only mode (`?mode=ro`), runs one query for
+  the `requested_at` column of `orchestration_v2_projection_runs`, and closes it. It never
+  reads message text, titles or anything else in that database.
 - `install.py` and `uninstall.py` are standard-library only. Their only subprocess
   calls are `uv sync --locked`, `/bin/launchctl bootout|bootstrap`, and
   `.venv/bin/python heatmap.py [--uninstall]`. `uninstall.py` deletes only the plist; the support dir and logs are deleted only by `heatmap.py --uninstall`.

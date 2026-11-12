@@ -2,7 +2,8 @@
 
 Your GitHub contribution graph as your macOS desktop wallpaper: green squares on black
 by default, or one of five built-in themes (§7), refreshed every 10 minutes by a per-user
-launchd job. Written in
+launchd job. With `--mode t3code` the squares show T3 Code runs per day instead, read from
+T3 Code's local database (§5a). Written in
 Python so the owner can audit every line.
 
 Non-goals for v1: multiple Spaces, headline text, custom (user-defined) themes, Linux, a resident daemon.
@@ -14,7 +15,8 @@ Non-goals for v1: multiple Spaces, headline text, custom (user-defined) themes, 
   else is the standard library. No shelling out at runtime except `launchctl`
   inside `install.py`/`uninstall.py`.
 - **No secrets.** No GitHub token. Reads only the public page
-  `https://github.com/users/<username>/contributions`.
+  `https://github.com/users/<username>/contributions`. In t3code mode it makes no network
+  request at all and reads one local file, read-only (§5a).
 - **No resident process.** Each run: fetch → parse → render → set wallpaper → exit.
   launchd starts it every 10 minutes. Most runs do no work (see §5).
 - **Fail safe.** Any error leaves the current wallpaper untouched, logs one line,
@@ -40,9 +42,9 @@ Runtime files (all created by `heatmap.py`):
 
 ```
 ~/Library/Application Support/gh-heatmap/
-  config.json          {"username": "...", "theme": "nord", "width": 40, "height": 25}
-                       written by install.py and by `heatmap.py --theme/--width/--height`;
-                       "theme", "width" and "height" are each absent for the default
+  config.json          {"username": "...", "mode": "t3code", "theme": "nord", "width": 40, "height": 25}
+                       written by install.py and by `heatmap.py --mode/--theme/--width/--height`;
+                       "mode", "theme", "width" and "height" are each absent for the default
   state.json           see §6
   backup.json          original wallpaper per display, captured once, before first change
   heatmap-<hash>.png   rendered wallpapers (current, previous, live, and up to 50 more
@@ -62,7 +64,12 @@ Runtime files (all created by `heatmap.py`):
 
 ```
 heatmap.py                 scheduled run (what launchd calls)
-heatmap.py --user NAME     override config.json username for this run only (never saved)
+heatmap.py --user NAME     override config.json username for this run only (never saved).
+                           GitHub mode only: with t3code mode in effect it is exit 1
+heatmap.py --mode NAME     where the squares come from: `github` (the default) or `t3code`
+                           (§5a). Saved and applied like --theme, with the same rules; `github`
+                           removes the saved key. Case-insensitive. In t3code mode the username
+                           is not read, so `--dry-run --mode t3code` needs no config.json
 heatmap.py --theme NAME    change the theme: save it in config.json (under the lock), then run as
                            usual, so it applies now. Case-insensitive; `default` removes the saved
                            theme. Needs an installed config.json (exit 1 otherwise; it never
@@ -76,9 +83,9 @@ heatmap.py --height PCT    a whole number 10-100, the `%` optional (`40`, `40%`)
                            starts: a bad value is exit 1 with nothing written
 heatmap.py --list-themes   print the five theme names, one per line, and exit 0. Handled before
                            logging starts: reads and writes no files, takes no lock. With
-                           --theme / --width / --height it is a usage error (exit 1)
+                           --mode / --theme / --width / --height it is a usage error (exit 1)
 heatmap.py --dry-run       fetch + render to ~/Library/Application Support/gh-heatmap/preview.png; do NOT set wallpaper.
-                           With --theme / --width / --height, previews them and saves nothing
+                           With --mode / --theme / --width / --height, previews them and saves nothing
 heatmap.py --force         ignore ETag and up-to-date checks; re-render and re-apply on every
                            display; still honours a recorded GitHub backoff and falls back to
                            cached data if the network fails
@@ -92,27 +99,32 @@ Exit codes:
 | code | meaning |
 |------|---------|
 | 0 | success: applied or already up to date on every screen; `--dry-run` wrote the preview; `--restore` restored everything (or there was no backup.json); `--uninstall` deleted everything; `--list-themes` |
-| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme (given or saved); an invalid size (given, or saved: anything but an int 10-100, including `null`, `true` and `40.0`); `--theme` / `--width` / `--height` with no config.json; any usage error (argparse is made to exit 1, because 2 means "skipped") |
+| 1 | error, including: `--dry-run` wrote no preview (backoff window, 429/503); `--restore` could not restore every screen; any screen failed; `--uninstall` kept the files (a screen still shows our image, or no screen to verify); an unknown theme or mode (given or saved); an invalid size (given, or saved: anything but an int 10-100, including `null`, `true` and `40.0`); `--mode` / `--theme` / `--width` / `--height` with no config.json; `--user` in t3code mode; T3 Code's database missing, busy or not laid out as expected (§5a); any usage error (argparse is made to exit 1, because 2 means "skipped") |
 | 2 | skipped gracefully (scheduled run): no screens, inside a GitHub backoff window, or the lock is busy |
 | 3 | `--restore` / `--uninstall` only: the lock is busy (uninstall.py waits and retries) |
 
 install.py relies on these codes to verify the first run (§10).
 
-`--theme NAME`, `--width PCT` or `--height PCT` on a real run: the username, theme and both
-sizes in effect are validated first (any failure is exit 1 with nothing written), then the
+`--mode NAME`, `--theme NAME`, `--width PCT` or `--height PCT` on a real run: the mode,
+username (GitHub mode only), theme and both sizes in effect are validated first (any failure is exit 1 with nothing written), then the
 given settings are saved together, then the run proceeds as usual and its exit code is
 returned unchanged. A saved setting never turns 1 or 2 into 0: if the run is skipped (2) or
 a screen fails (1), the next successful run applies it.
 
-Config, theme and size are read once per run, after `--restore` / `--uninstall` have been
+Saving any setting needs an installed config.json with a valid username, in either mode
+(install.py always writes one).
+
+Config, mode, theme and size are read once per run, after `--restore` / `--uninstall` have been
 dispatched (those never read config.json, so a bad setting cannot block recovery) and
 before the backoff check, fetch or any `state.json` write. A flag given on the command
 line replaces the saved value without validating it, so `--width default` clears an invalid
-saved width. An unknown saved theme or invalid saved size is exit 1, never a silent fall
-back to the default.
+saved width. An unknown saved theme or mode, or an invalid saved size, is exit 1, never a
+silent fall back to the default.
 Logging: `logging` to the rotating file; also to stderr when stderr is a TTY.
 
 ## 4. Fetch
+
+GitHub mode only; t3code mode makes no request (§5a).
 
 - Validate username against `^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$` before building the URL.
 - One `urllib.request` GET to `https://github.com/users/<username>/contributions`,
@@ -161,6 +173,45 @@ ncols = max(col) + 1
 
 Cells not present (edge padding) are simply not drawn.
 
+## 5a. T3 Code source (`--mode t3code`)
+
+Replaces §4 and §5 in t3code mode; everything from §6 on is shared. T3 Code is not affiliated
+with this project; its database layout is internal to it and may change.
+
+- **File:** `~/.t3/userdata/statev2.sqlite` (the default T3 Code data directory;
+  `T3CODE_HOME` is not read, since launchd runs with a bare environment). If it is not a file:
+  exit 1, "T3 Code database not found".
+- **Open:** `sqlite3.connect("file:<path>?mode=ro", uri=True, timeout=2)`. `sqlite3` is imported
+  inside the function, so GitHub mode, `--restore` and `--uninstall` never import it.
+  `mode=ro` never creates or changes the database file itself. The database is in WAL mode,
+  so SQLite may create or update its `-shm` / `-wal` files beside it, as any reader does
+  (e.g. when T3 Code is not running).
+- **Query:** `SELECT requested_at FROM orchestration_v2_projection_runs`, one row per run (a
+  turn sent to an agent), `fetchall`, then close, before any parsing or rendering, so the
+  read lasts milliseconds. No `WHERE`: every row is parsed, so a changed timestamp format is
+  an error rather than rows silently filtered out. Any `sqlite3.Error` (busy, no such table
+  or column, not a database) is exit 1; the next scheduled run retries.
+- **Window:** `anchor = today - 364 days`; `start` = the Sunday on or before `anchor`;
+  every date from `start` to `today` (365-371 days, 53 columns), `today` being the local date.
+- **Count:** every `requested_at` goes through `datetime.fromisoformat`. Not a string, not
+  parseable, or without a UTC offset: exit 1 (the format changed; never guess). Each is
+  converted to the system time zone (`.astimezone()`, using that moment's own DST offset)
+  and counted on its local date; dates outside the window are ignored.
+- **Levels:** 0 for a day with no runs. The reference is the sorted run counts of the
+  *completed* active days: days before today with at least one run (`m` of them). If
+  `m == 0`, any active day is 4. Otherwise
+  `level = min(4, ceil(4 * (bisect_left(reference, runs) + 1) / m))`. So ties share the lowest
+  level of their group, and with distinct counts active days spread roughly evenly over
+  levels 1-4, the busiest being 4. Ties can leave upper levels unused: completed counts
+  `[3, 3, 3, 3]` are all level 1, and `[5, 5, 5, 5, 187]` are 1, 1, 1, 1, 4. Today is scored against the reference but is not in it, so during a
+  day only today's square can change (and only upward); completed days are re-scored once a
+  day, when the window moves anyway. This is this tool's own rule, not GitHub's.
+- The result goes through the same `validate_cells` as §5. An empty table gives an all-0 grid
+  (real data); a missing table or column can never look empty, it is an error.
+- **Counts every run in the table**, including turns in subagent and delegated threads,
+  scheduled tasks, and deleted threads while their rows remain. History starts when T3 Code
+  began writing this database; earlier days are 0.
+
 ## 6. State and change detection
 
 `state.json` (written atomically: temp file in same dir + `os.replace`):
@@ -178,6 +229,11 @@ Cells not present (edge padding) are simply not drawn.
   "version": 1
 }
 ```
+
+In t3code mode `etag`, `cells`, `fetched_at`, `retry_until` and `username` are neither used
+nor changed (the state is loaded with no username), so switching back to GitHub resumes with
+a normal conditional request, and a recorded GitHub backoff does not stop t3code runs.
+`applied`, `applied_prev` and `backup_not_needed` are shared by both modes.
 
 `render_hash = sha256(json.dumps({"cells": cells, "w": W, "h": H,
 "style": STYLE_VERSION, "theme": THEME, "box": [BW, BH]}, sort_keys=True))[:16]`, where
@@ -343,10 +399,13 @@ ok, err = ws.setDesktopImageURL_forScreen_options_error_(NSURL.fileURLWithPath_(
 ## 10. `install.py`
 
 ```
-install.py --user NAME [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
+install.py --user NAME [--mode NAME] [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
 ```
 
-1. Validate username (same regex), `--theme` (case-insensitive; one of
+`--user` stays required in either mode, so config.json always has a username.
+
+1. Validate username (same regex), `--mode` (case-insensitive; `github` or `t3code`, which
+   must match heatmap.py's `MODES`), `--theme` (case-insensitive; one of
    `THEME_NAMES`, which must match `heatmap.py --list-themes`, or `default`) and
    `--width` / `--height` (same rule as heatmap.py, §3). All are checked before anything
    else, so a bad value changes nothing (exit 1). Require `uv` on PATH
@@ -356,11 +415,12 @@ install.py --user NAME [--theme NAME] [--width PCT] [--height PCT] [--interval 6
    `--frozen` would not detect a stale lock).
 3. Create the support dir. Take the lock (§6; retry every 2 s, about 30 s, then exit 1),
    write `config.json` atomically, release the lock (the first run takes it itself).
-   Theme, width and height are each resolved on their own: the flag if given (`default`
-   = none); otherwise a reinstall keeps the value saved in the existing config.json (the
-   theme lowercased), so `install.py --theme nord` keeps a saved size. The file is read
+   Mode, theme, width and height are each resolved on their own: the flag if given (`default`,
+   or `github` for the mode, = none); otherwise a reinstall keeps the value saved in the
+   existing config.json (the mode and theme lowercased), so `install.py --theme nord` keeps a
+   saved size and mode. The file is read
    once, under the lock. If it is unreadable or not a JSON object, or a saved value that
-   is not overridden is invalid (an unknown theme; a size that is not an int 10-100), it
+   is not overridden is invalid (an unknown mode or theme; a size that is not an int 10-100), it
    prints a warning and uses the default for that setting instead of failing. Other keys
    are not kept.
 4. First run by hand: `.venv/bin/python heatmap.py`. It must exit 0, and afterwards
@@ -457,4 +517,18 @@ restore, so a later run deletes whatever remains.
     and `--restore --width 40` exit 1. With no size set, the PNG name is the same as
     before this feature (no re-render on upgrade). Hand-edit `"width": "big"` → a run exits 1,
     `--restore` still works, `--width default` fixes it.
+4c. t3code mode (with T3 Code installed and used):
+    `--dry-run --mode t3code` writes preview.png and leaves config.json and state.json
+    unchanged; with no config.json at all it still works. `--mode t3code` → the T3 Code grid
+    on every display, config.json has `"mode": "t3code"`, state.json still has GitHub's
+    `etag`, `cells` and `username`; run again → "up to date; skipped", no new PNG.
+    `launchctl kickstart gui/$UID/local.gh-heatmap` → the log shows a `t3code:` line from
+    the launchd run. With `retry_until` in the future, t3code runs still apply and GitHub
+    runs still skip. `--mode github` → the GitHub grid, `"mode"` gone, and the PNG name is
+    the one from before the switch. `--mode bogus`, `--restore --mode t3code` and
+    `--mode t3code --user x` exit 1 and change nothing. Hand-edit `"mode": "x"` → a run
+    exits 1, `--restore` still works, `--mode github` fixes it. `install.py --user jballo
+    --mode t3code`, then a reinstall without `--mode` keeps it. With T3 Code quit, a run
+    exits 0 and `statev2.sqlite`'s size and mtime are unchanged; T3 Code then starts
+    normally.
 5. `uninstall.py` → original wallpaper back, no files left under `~/Library/*/gh-heatmap*` except the empty `~/Library/Application Support/gh-heatmap.lock`.

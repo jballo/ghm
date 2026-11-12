@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Install gh-heatmap for the current user (SPEC §10).
 
-Usage: python3 install.py --user NAME [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
+Usage: python3 install.py --user NAME [--mode NAME] [--theme NAME] [--width PCT] [--height PCT] [--interval 600]
 
-Runs `uv sync --locked`, writes config.json (keeping a saved theme and size unless the flag is given),
+Runs `uv sync --locked`, writes config.json (keeping a saved mode, theme and size unless the flag is given),
 does one run by hand (which must succeed
 and leave a wallpaper backup), then writes and loads the per-user LaunchAgent. Everything lives under $HOME; no sudo. Uses only the
 standard library so it runs on any Python 3.9+ (including macOS's /usr/bin/python3).
@@ -30,6 +30,9 @@ from typing import Any
 USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 THEME_NAMES = ("dracula", "gruvbox", "nord", "panda", "tokyo-night")
 RESET_THEME = "default"
+MODE_GITHUB, MODE_T3CODE = "github", "t3code"
+MODES = (MODE_GITHUB, MODE_T3CODE)
+SETTING_KEYS = ("mode", "theme", "width", "height")
 SIZE_RE = re.compile(r"^([0-9]{1,3})%?$")
 SIZE_MIN, SIZE_MAX = 10, 100
 RESET_SIZE = "default"
@@ -100,7 +103,7 @@ def saved_settings(overridden: set[str]) -> dict[str, Any]:
     """The theme, width and height in an existing config.json, so a reinstall keeps them
     (SPEC §10). Keys in `overridden` (given on the command line) are not read. Anything
     unusable is dropped with a warning instead of failing the install; absent = default."""
-    wanted = {"theme", *SIZE_KEYS} - overridden
+    wanted = set(SETTING_KEYS) - overridden
     if not wanted:
         return {}
     try:
@@ -123,6 +126,15 @@ def saved_settings(overridden: set[str]) -> dict[str, Any]:
         kept["theme"] = theme.lower()
     elif theme.lower() != RESET_THEME:
         print(f"warning: saved theme {theme!r} is unknown; using the default")
+    mode = config.get("mode")
+    if "mode" not in wanted or mode is None:
+        pass
+    elif not isinstance(mode, str):
+        print(f"warning: saved mode {mode!r} is not a name; using {MODE_GITHUB}")
+    elif mode.lower() == MODE_T3CODE:
+        kept["mode"] = MODE_T3CODE
+    elif mode.lower() != MODE_GITHUB:
+        print(f"warning: saved mode {mode!r} is unknown; using {MODE_GITHUB}")
     for key in SIZE_KEYS:
         if key not in wanted or key not in config:
             continue
@@ -136,8 +148,8 @@ def saved_settings(overridden: set[str]) -> dict[str, Any]:
 
 
 def describe(config: dict[str, Any]) -> str:
-    """'theme: nord, width: 40%, height: default' for the install summary."""
-    parts = [f"theme: {config.get('theme', RESET_THEME)}"]
+    """'mode: github, theme: nord, width: 40%, height: default' for the install summary."""
+    parts = [f"mode: {config.get('mode', MODE_GITHUB)}", f"theme: {config.get('theme', RESET_THEME)}"]
     parts += [f"{key}: {config[key]}%" if key in config else f"{key}: {RESET_SIZE}" for key in SIZE_KEYS]
     return ", ".join(parts)
 
@@ -183,6 +195,9 @@ def main() -> int:
     """Run the install steps in order; stop at the first failure."""
     parser = ArgumentParser(description="Install the gh-heatmap LaunchAgent.")
     parser.add_argument("--user", required=True, metavar="NAME", help="GitHub username")
+    parser.add_argument("--mode", metavar="NAME",
+                        help=f"what the squares show: {MODE_GITHUB} (your contribution graph) or {MODE_T3CODE} "
+                             "(T3 Code runs per day). Omitted: keep the saved mode on a reinstall, else github")
     parser.add_argument("--theme", metavar="NAME",
                         help=f"colour theme: {', '.join(THEME_NAMES)}, or {RESET_THEME} (the green look). "
                              "Omitted: keep the saved theme on a reinstall, else default")
@@ -203,7 +218,11 @@ def main() -> int:
     # Checked before uv sync, so an unknown name or bad size changes nothing at all.
     if args.theme is not None and args.theme.lower() not in THEME_NAMES + (RESET_THEME,):
         sys.exit(f"unknown theme {args.theme!r}; valid: {', '.join(THEME_NAMES)} (or {RESET_THEME!r})")
+    if args.mode is not None and args.mode.lower() not in MODES:
+        sys.exit(f"unknown mode {args.mode!r}; valid: {', '.join(MODES)}")
     given: dict[str, Any] = {}  # flags given on the command line; None = back to the default
+    if args.mode is not None:
+        given["mode"] = None if args.mode.lower() == MODE_GITHUB else args.mode.lower()
     if args.theme is not None:
         given["theme"] = None if args.theme.lower() == RESET_THEME else args.theme.lower()
     for key in SIZE_KEYS:
@@ -226,7 +245,7 @@ def main() -> int:
         # Each setting independently: the flag if given, else the saved value, else default.
         settings = {**saved_settings(set(given)), **given}
         config: dict[str, Any] = {"username": args.user}
-        config.update({key: settings[key] for key in ("theme", *SIZE_KEYS) if settings.get(key) is not None})
+        config.update({key: settings[key] for key in SETTING_KEYS if settings.get(key) is not None})
         atomic_write_bytes(CONFIG_FILE, (json.dumps(config, indent=2) + "\n").encode("utf-8"))
     finally:
         os.close(lock_fd)
@@ -237,9 +256,11 @@ def main() -> int:
     #    2 means it skipped (no screens, GitHub backoff, lock busy); 1 is an error.
     print("==> first run (sets the wallpaper)")
     code = subprocess.run([str(VENV_PYTHON), str(HEATMAP)], cwd=PROJECT_DIR, check=False).returncode
+    t3code = config.get("mode") == MODE_T3CODE
     if code == 2:
-        sys.exit("first run was skipped (no screens, GitHub backoff, or another run in progress); "
-                 "nothing scheduled - try again later")
+        reasons = "no screens, or another run in progress" if t3code else \
+            "no screens, GitHub backoff, or another run in progress"
+        sys.exit(f"first run was skipped ({reasons}); nothing scheduled - try again later")
     if code != 0:
         sys.exit(f"first run failed (exit {code}); see ~/Library/Logs/gh-heatmap.log - nothing scheduled")
     if not backup_ok():
@@ -256,8 +277,10 @@ def main() -> int:
     subprocess.run([LAUNCHCTL, "bootstrap", domain, str(PLIST_PATH)], check=True)
 
     # 7. Report.
-    print(f"\nInstalled {LABEL}: runs every {args.interval} s for GitHub user {args.user} "
-          f"({describe(config)}).")
+    source = "showing T3 Code usage" if t3code else f"for GitHub user {args.user}"
+    print(f"\nInstalled {LABEL}: runs every {args.interval} s {source} ({describe(config)}).")
+    other = MODE_GITHUB if t3code else MODE_T3CODE
+    print(f"  mode:      cd {PROJECT_DIR} && uv run heatmap.py --mode {other}   (--mode {MODE_GITHUB} or {MODE_T3CODE})")
     print(f"  theme:     cd {PROJECT_DIR} && uv run heatmap.py --theme NAME   (--list-themes for names)")
     print(f"  size:      cd {PROJECT_DIR} && uv run heatmap.py --width 40% --height 30%   ({RESET_SIZE} resets)")
     print(f"  check:     launchctl print {domain}/{LABEL}")
